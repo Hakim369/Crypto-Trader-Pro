@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Level lines: HTF Resistance & Support bands -->
+    <path
+        android:pathData="M24,34 L84,34"
+        android:strokeWidth="2.5"
+        android:strokeColor="#FF5252"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M24,74 L84,74"
+        android:strokeWidth="2.5"
+        android:strokeColor="#00E676"
+        android:strokeLineCap="round" />
+
+    <!-- Center Pivot/Breakout dashed guide -->
+    <path
+        android:pathData="M24,54 L84,54"
+        android:strokeWidth="1.5"
+        android:strokeColor="#00E5FF"
+        android:strokeLineCap="round" />
+
+    <!-- Candlestick 1: Rejection candle with wick -->
+    <path
+        android:pathData="M38,36 L38,62"
+        android:strokeWidth="1.5"
+        android:strokeColor="#FF5252" />
+    <path
+        android:pathData="M35,42 L41,42 L41,56 L35,56 Z"
+        android:fillColor="#FF5252" />
+
+    <!-- Candlestick 2: Middle pullback candle -->
+    <path
+        android:pathData="M54,48 L54,72"
+        android:strokeWidth="1.5"
+        android:strokeColor="#00E676" />
+    <path
+        android:pathData="M51,52 L57,52 L57,66 L51,66 Z"
+        android:fillColor="#00E676" />
+
+    <!-- Candlestick 3: Strong continuation bar -->
+    <path
+        android:pathData="M70,30 L70,58"
+        android:strokeWidth="1.5"
+        android:strokeColor="#00E5FF" />
+    <path
+        android:pathData="M67,36 L73,36 L73,50 L67,50 Z"
+        android:fillColor="#00E5FF" />
+
+    <!-- Dynamic proactive asymmetric trajectory arrow -->
+    <path
+        android:pathData="M34,68 L52,58 L68,44 L78,32"
+        android:strokeWidth="3"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M72,31 L80,31 L80,39 Z"
+        android:fillColor="#FFFFFF" />
+</vector>
