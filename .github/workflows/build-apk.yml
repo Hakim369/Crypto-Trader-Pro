@@ -30,25 +30,27 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
+          gradle-version: '9.3.1'
           cache-read-only: false
 
-      - name: Ensure Build Environment Secrets & Files
+      - name: Ensure Build Environment Secrets & Keystore
         run: |
           if [ ! -f .env ]; then
             touch .env
           fi
-          # Ensure debug.keystore exists for debug signing if not present
-          if [ ! -f debug.keystore ]; then
+          if [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          elif [ ! -f debug.keystore ]; then
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
       - name: Assemble Debug APK
         if: ${{ github.event.inputs.build_type == 'debug' }}
-        run: ./gradlew :app:assembleDebug -Dorg.gradle.daemon=false -Dksp.daemon=false
+        run: gradle :app:assembleDebug -Dorg.gradle.daemon=false -Dksp.daemon=false
 
       - name: Assemble Release APK
         if: ${{ github.event.inputs.build_type == 'release' }}
-        run: ./gradlew :app:assembleRelease -Dorg.gradle.daemon=false -Dksp.daemon=false
+        run: gradle :app:assembleRelease -Dorg.gradle.daemon=false -Dksp.daemon=false
 
       - name: Upload Debug APK Artifact
         if: ${{ github.event.inputs.build_type == 'debug' }}
