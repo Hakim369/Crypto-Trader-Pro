@@ -10,11 +10,16 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.AppBottomNavigationBar
@@ -33,6 +38,7 @@ import com.example.ui.theme.DarkBackground
 import com.example.ui.theme.MyApplicationTheme
 
 class MainActivity : ComponentActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -49,10 +55,29 @@ fun ProactiveMsApp(viewModel: MainViewModel = viewModel()) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     var currentDestination by remember { mutableStateOf(AppDestination.DASHBOARD) }
 
+    // Spec §3 Orphaned Order OS Intercept: the monitoring loop dies the moment the app
+    // leaves the foreground, so leaving it with live credentials and resting orders must
+    // surface the intercept. The decision (intercept vs. plain wipe) is made in the
+    // ViewModel's onAppBackgrounded(); here we only forward the lifecycle event once
+    // per transition via the activity lifecycle.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = object : DefaultLifecycleObserver {
+            override fun onPause(owner: LifecycleOwner) {
+                viewModel.onAppBackgrounded()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
     Scaffold(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkBackground),
+            .background(DarkBackground)
+            .testTag("app_scaffold"),
         topBar = {
             TopBar(
                 executionMode = uiState.executionMode,
@@ -119,7 +144,10 @@ fun ProactiveMsApp(viewModel: MainViewModel = viewModel()) {
                         isSessionActive = uiState.isSessionActive,
                         onToggleKillSwitch = { viewModel.toggleKillSwitch() },
                         onStartSession = { k, s -> viewModel.startApiSession(k, s) },
-                        onTerminateSession = { viewModel.terminateApiSession() }
+                        onTerminateSession = { viewModel.terminateApiSession() },
+                        isDiagnosticsRunning = uiState.isDiagnosticsRunning,
+                        hasLiveDiagnostics = uiState.hasLiveDiagnostics,
+                        onRunDiagnostics = { viewModel.runPreFlightDiagnostics() }
                     )
                 }
 
@@ -139,11 +167,13 @@ fun ProactiveMsApp(viewModel: MainViewModel = viewModel()) {
             }
         }
 
-        // Section 3: Orphaned Order OS Intercept Dialog
+        // Section 3: Orphaned Order OS Intercept Dialog.
+        // "Cancel" keeps the foreground session alive (user stayed in the app);
+        // "Acknowledge & Wipe" performs the §3 suspension wipe.
         OrphanedOrderWarningDialog(
             isOpen = uiState.isOrphanedOrderWarningOpen,
             onAcknowledgeAndWipe = { viewModel.acknowledgeOrphanedOrderWarning() },
-            onDismiss = { viewModel.acknowledgeOrphanedOrderWarning() }
+            onDismiss = { viewModel.dismissOrphanedOrderWarning() }
         )
 
         // Section 24: Manual Override Dialog with Persistent Guardrail Warnings

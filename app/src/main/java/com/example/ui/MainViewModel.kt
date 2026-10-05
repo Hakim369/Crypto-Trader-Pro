@@ -22,9 +22,12 @@ import com.example.data.model.RiskEnvelope
 import com.example.data.model.VenueHealth
 import com.example.engine.CampaignEngine
 import com.example.engine.FeatureEngine
+import com.example.engine.HardwareDiagnosticsProvider
 import com.example.engine.InvalidationAction
 import com.example.engine.InvalidationEngine
 import com.example.engine.MarketDataRepository
+import com.example.engine.OrphanInterceptDecision
+import com.example.engine.OrphanInterceptPolicy
 import com.example.engine.OrderBookSnapshot
 import com.example.engine.OverrideWarning
 import com.example.engine.PathEngine
@@ -59,7 +62,11 @@ data class MainUiState(
     val isSessionActive: Boolean = false,
     val isOrphanedOrderWarningOpen: Boolean = false,
     val isOverrideDialogOpen: Boolean = false,
-    val overrideWarnings: List<OverrideWarning> = emptyList()
+    val overrideWarnings: List<OverrideWarning> = emptyList(),
+    /** True while a pre-flight hardware/network diagnostics sample is being taken (Spec §2). */
+    val isDiagnosticsRunning: Boolean = false,
+    /** True once a real diagnostics sample has populated venueHealth (vs. built-in defaults). */
+    val hasLiveDiagnostics: Boolean = false
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -77,6 +84,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val sessionManager = SessionSecurityManager()
     private val simulationHarness = SimulationHarness()
 
+    /** Phase 1 (Spec §2): real OS diagnostics; no-arg constructor stays test-friendly. */
+    private val diagnosticsProvider: HardwareDiagnosticsProvider? =
+        runCatching { HardwareDiagnosticsProvider(application) }.getOrNull()
+
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
@@ -87,6 +98,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     init {
         loadInitialData()
         observeAuditLogs()
+        runPreFlightDiagnostics()
     }
 
     private fun loadInitialData() {
@@ -158,6 +170,52 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             sessionManager.isSessionActive.collect { active ->
                 _uiState.value = _uiState.value.copy(isSessionActive = active)
+            }
+        }
+    }
+
+    /**
+     * Phase 1 (Spec §2): sample real device state and mandatory-feed latency, then feed
+     * the authoritative thresholds in SessionSecurityManager. Safe no-op if the provider
+     * is unavailable (e.g. unit-test environments without Android framework bindings).
+     */
+    fun runPreFlightDiagnostics() {
+        val provider = diagnosticsProvider ?: return
+        if (_uiState.value.isDiagnosticsRunning) return
+
+        _uiState.value = _uiState.value.copy(isDiagnosticsRunning = true)
+        viewModelScope.launch {
+            try {
+                val sample = provider.sample()
+                sessionManager.updateHardwareDiagnostics(
+                    pingBinance = sample.binancePingMs,
+                    pingCoinGlass = sample.coinglassPingMs,
+                    isLowPower = sample.isLowPowerMode,
+                    isThrottled = sample.isThermallyThrottled,
+                    availableRamMb = sample.availableRamMb
+                )
+                _uiState.value = _uiState.value.copy(
+                    isDiagnosticsRunning = false,
+                    hasLiveDiagnostics = true
+                )
+                repository.logAction(
+                    asset = "PORTFOLIO",
+                    campaignId = "SYS_DIAGNOSTICS",
+                    action = AuditLogAction.CAMPAIGN_STAGED,
+                    reasonCode = if (sessionManager.venueHealth.value.isHealthy)
+                        "PREFLIGHT_PASSED" else "PREFLIGHT_GUARDRAIL_TRIPPED",
+                    message = "Pre-flight diagnostics: Binance ${sample.binancePingMs}ms, CoinGlass ${sample.coinglassPingMs}ms, " +
+                        "RAM ${sample.availableRamMb}MB, battery ${sample.batteryLevelPct}%"
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(isDiagnosticsRunning = false)
+                repository.logAction(
+                    asset = "PORTFOLIO",
+                    campaignId = "SYS_DIAGNOSTICS",
+                    action = AuditLogAction.CAMPAIGN_STAGED,
+                    reasonCode = "PREFLIGHT_ERROR",
+                    message = "Pre-flight diagnostics failed: ${e.message ?: e.javaClass.simpleName}"
+                )
             }
         }
     }
@@ -346,6 +404,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = _uiState.value.copy(isOrphanedOrderWarningOpen = true)
     }
 
+    fun dismissOrphanedOrderWarning() {
+        _uiState.value = _uiState.value.copy(isOrphanedOrderWarningOpen = false)
+    }
+
     fun acknowledgeOrphanedOrderWarning() {
         _uiState.value = _uiState.value.copy(isOrphanedOrderWarningOpen = false)
         // Suspension wipe: immediately wipe API keys from RAM
@@ -358,6 +420,39 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 reasonCode = "SUSPENSION_WIPE",
                 message = "App lifecycle suspended. API keys securely wiped from RAM per Zero-Persistence mandate."
             )
+        }
+    }
+
+    /**
+     * Phase 1 (Spec §3 Orphaned Order OS Intercept): invoked by MainActivity's lifecycle
+     * observer when the app is leaving the foreground with live API credentials.
+     *
+     * Decision logic is delegated to [OrphanInterceptPolicy] (pure, unit-tested):
+     *  - No active session → nothing to orphan; no action.
+     *  - Session active but no resting orders → wipe keys immediately (§3 suspension policy).
+     *  - Session active with resting orders → full-screen intercept is mandatory.
+     */
+    fun onAppBackgrounded() {
+        when (
+            OrphanInterceptPolicy.decide(
+                hasActiveSession = sessionManager.hasValidActiveSession(),
+                hasRestingOrders = OrphanInterceptPolicy.hasRestingOrLiveOrders(_uiState.value.campaigns)
+            )
+        ) {
+            OrphanInterceptDecision.SHOW_INTERCEPT -> openOrphanedOrderWarning()
+            OrphanInterceptDecision.WIPE_ONLY -> {
+                sessionManager.terminateSessionAndWipeRam()
+                viewModelScope.launch {
+                    repository.logAction(
+                        asset = "PORTFOLIO",
+                        campaignId = "SYS_SECURITY",
+                        action = AuditLogAction.ORPHANED_ALERT,
+                        reasonCode = "SUSPENSION_WIPE",
+                        message = "App backgrounded without resting orders. Session keys wiped from RAM."
+                    )
+                }
+            }
+            OrphanInterceptDecision.NO_ACTION -> Unit
         }
     }
 

@@ -5,6 +5,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,6 +23,7 @@ import androidx.compose.material.icons.filled.Dangerous
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
@@ -66,6 +68,9 @@ fun RiskGuardrailsScreen(
     onToggleKillSwitch: () -> Unit,
     onStartSession: (key: String, secret: String) -> Unit,
     onTerminateSession: () -> Unit,
+    isDiagnosticsRunning: Boolean,
+    hasLiveDiagnostics: Boolean,
+    onRunDiagnostics: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var apiKeyInput by remember { mutableStateOf("") }
@@ -202,39 +207,99 @@ fun RiskGuardrailsScreen(
                     .border(1.dp, CardBorder, RoundedCornerShape(10.dp))
                     .padding(12.dp)
             ) {
-                Text(
-                    text = "PRE-FLIGHT HARDWARE DIAGNOSTICS",
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = SlateTextSecondary,
-                        fontSize = 10.sp
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "PRE-FLIGHT HARDWARE DIAGNOSTICS",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = SlateTextSecondary,
+                            fontSize = 10.sp
+                        )
                     )
-                )
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(
+                                    if (hasLiveDiagnostics) EmeraldBull.copy(alpha = 0.15f)
+                                    else AmberWarning.copy(alpha = 0.12f)
+                                )
+                                .border(
+                                    1.dp,
+                                    if (hasLiveDiagnostics) EmeraldBull.copy(alpha = 0.5f)
+                                    else AmberWarning.copy(alpha = 0.5f),
+                                    RoundedCornerShape(4.dp)
+                                )
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = when {
+                                    isDiagnosticsRunning -> "SAMPLING…"
+                                    hasLiveDiagnostics -> "LIVE SAMPLE"
+                                    else -> "DEFAULTS"
+                                },
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = if (hasLiveDiagnostics) EmeraldBull else AmberWarning,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 8.sp
+                                )
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(6.dp))
+
+                        OutlinedButton(
+                            onClick = onRunDiagnostics,
+                            enabled = !isDiagnosticsRunning,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                            modifier = Modifier
+                                .height(26.dp)
+                                .testTag("rerun_diagnostics_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Re-run pre-flight diagnostics",
+                                modifier = Modifier.size(12.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(if (isDiagnosticsRunning) "Sampling…" else "Re-run", fontSize = 9.sp)
+                        }
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(10.dp))
 
                 DiagnosticRow(
                     icon = Icons.Default.Speed,
                     label = "Binance Futures Gateway Latency",
-                    statusText = "${venueHealth.binancePingMs} ms",
+                    statusText = if (isDiagnosticsRunning) "Sampling…" else "${venueHealth.binancePingMs} ms",
                     isPass = !venueHealth.isLatencySpike
                 )
                 DiagnosticRow(
                     icon = Icons.Default.Speed,
                     label = "CoinGlass Derivatives API Latency",
-                    statusText = "${venueHealth.coinglassPingMs} ms",
+                    statusText = if (isDiagnosticsRunning) "Sampling…" else "${venueHealth.coinglassPingMs} ms",
                     isPass = !venueHealth.isLatencySpike
                 )
                 DiagnosticRow(
                     icon = Icons.Default.Memory,
                     label = "Device Memory (RAM) Allocation",
-                    statusText = "${venueHealth.availableRamMb} MB Available",
+                    statusText = if (isDiagnosticsRunning) "Sampling…" else "${venueHealth.availableRamMb} MB Available",
                     isPass = !venueHealth.isRamConstrained
                 )
                 DiagnosticRow(
                     icon = Icons.Default.CheckCircle,
                     label = "Thermal State & Low Power Mode",
-                    statusText = if (venueHealth.isLowPowerMode || venueHealth.isThermallyThrottled) "Throttled" else "Nominal",
+                    statusText = when {
+                        isDiagnosticsRunning -> "Sampling…"
+                        venueHealth.isLowPowerMode || venueHealth.isThermallyThrottled -> "Throttled"
+                        else -> "Nominal"
+                    },
                     isPass = !venueHealth.isLowPowerMode && !venueHealth.isThermallyThrottled
                 )
             }
