@@ -73,5 +73,10 @@ data class BacktestMetrics(
         "Balance" to 890.0
     ),
     val falsePositiveInvalidationPct: Double = 6.4,
-    val slowInvalidationPct: Double = 3.1
+    val slowInvalidationPct: Double = 3.1,
+    // §37 replay-harness outputs (computed, not canned): zero until a replay runs.
+    val totalPnlUsd: Double = 0.0,
+    val replayedCampaigns: Int = 0,
+    val filledSliceCount: Int = 0,
+    val proactiveEdgeVsBaselinePct: Double = 0.0
 )

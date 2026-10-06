@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.sp
 import com.example.data.model.BacktestMetrics
 import com.example.engine.SimulationScenario
 import com.example.ui.theme.AmberWarning
+import com.example.engine.ReplayResult
 import com.example.ui.theme.CardBackground
 import com.example.ui.theme.CardBorder
 import com.example.ui.theme.CrimsonBear
@@ -51,6 +52,9 @@ fun SimulationScreen(
     metrics: BacktestMetrics,
     selectedScenario: SimulationScenario?,
     onRunScenario: (SimulationScenario) -> Unit,
+    lastReplay: ReplayResult? = null,
+    isReplayRunning: Boolean = false,
+    onRunReplay: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val scenarios = listOf(
@@ -166,6 +170,84 @@ fun SimulationScreen(
                     explanation = "Premature cancellations before original target was reached",
                     valueColor = SlateTextMuted
                 )
+            }
+        }
+
+        // §37 historical replay runner (Phase 5)
+        item {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(CardBackground, RoundedCornerShape(10.dp))
+                    .border(1.dp, CardBorder, RoundedCornerShape(10.dp))
+                    .padding(12.dp)
+            ) {
+                Text(
+                    text = "DETERMINISTIC HISTORICAL REPLAY (PHASE 5)",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = CyanAccent,
+                        fontSize = 10.sp
+                    )
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = { onRunReplay(false) },
+                        enabled = !isReplayRunning,
+                        modifier = Modifier.height(30.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isReplayRunning) Color(0xFF1E293B) else EmeraldBull,
+                            contentColor = Color.Black
+                        )
+                    ) {
+                        Text(
+                            if (isReplayRunning) "Replaying…" else "Replay History",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Button(
+                        onClick = { onRunReplay(true) },
+                        enabled = !isReplayRunning,
+                        modifier = Modifier.height(30.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF1E293B),
+                            contentColor = CyanAccent
+                        )
+                    ) {
+                        Text("Run Symmetric Baseline", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+                lastReplay?.let { replay ->
+                    Spacer(modifier = Modifier.height(10.dp))
+                    ReplayStatRow(
+                        label = "Replayed boards",
+                        value = "${replay.metrics.replayedCampaigns}"
+                    )
+                    ReplayStatRow(
+                        label = "Filled slices",
+                        value = "${replay.metrics.filledSliceCount}"
+                    )
+                    ReplayStatRow(
+                        label = "Replay PnL",
+                        value = "$${replay.metrics.totalPnlUsd}"
+                    )
+                    ReplayStatRow(
+                        label = "Miss rate / Max adverse excursion",
+                        value = "${replay.metrics.orderMissRatePct}% / ${replay.metrics.maxAdverseExcursionPct}%"
+                    )
+                    ReplayStatRow(
+                        label = "False-positive / slow invalidations",
+                        value = "${replay.metrics.falsePositiveInvalidationPct}% / ${replay.metrics.slowInvalidationPct}%"
+                    )
+                    if (replay.degradedFeeds) {
+                        Text(
+                            text = "Crowding/liquidity feeds absent: run degraded toward neutral posture (§37)",
+                            style = MaterialTheme.typography.labelSmall.copy(color = AmberWarning, fontSize = 9.sp)
+                        )
+                    }
+                }
             }
         }
 
@@ -319,6 +401,30 @@ private fun MetricItem(title: String, value: String, explanation: String, valueC
         Text(
             text = explanation,
             style = MaterialTheme.typography.labelSmall.copy(color = SlateTextMuted, fontSize = 9.sp)
+        )
+    }
+}
+
+@Composable
+private fun ReplayStatRow(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall.copy(color = SlateTextPrimary, fontSize = 10.sp)
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                color = SlateTextSecondary,
+                fontSize = 10.sp
+            )
         )
     }
 }

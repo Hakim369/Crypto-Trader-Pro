@@ -40,6 +40,8 @@ import com.example.engine.OrphanInterceptPolicy
 import com.example.engine.OrderBookSnapshot
 import com.example.engine.OverrideWarning
 import com.example.engine.PathEngine
+import com.example.engine.ReplayEngine
+import com.example.engine.ReplayResult
 import com.example.engine.RiskEngine
 import com.example.engine.SessionSecurityManager
 import com.example.engine.SimulationHarness
@@ -71,6 +73,10 @@ data class MainUiState(
     val executionMode: ExecutionMode = ExecutionMode.PAPER,
     val auditLogs: List<AuditLogEntry> = emptyList(),
     val backtestMetrics: BacktestMetrics = BacktestMetrics(),
+    /** Phase 5 (§37): result of the latest historical replay, null until one runs. */
+    val lastReplay: ReplayResult? = null,
+    /** True while the §37 replay is computing. */
+    val isReplayRunning: Boolean = false,
     val selectedScenario: SimulationScenario? = null,
     val isSessionActive: Boolean = false,
     val isOrphanedOrderWarningOpen: Boolean = false,
@@ -100,6 +106,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val riskEngine = RiskEngine()
     private val sessionManager = SessionSecurityManager()
     private val simulationHarness = SimulationHarness()
+    private val replayEngine = ReplayEngine()
 
     /** Phase 4 (§36): execution gate + live order routing state. */
     private val executionEngine = ExecutionEngine(riskEngine)
@@ -1031,6 +1038,79 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             reasonCode = "POSITION_MISMATCH_LOCK",
             message = "Unexpected position mismatch (expected $expectedQty, exchange $exchangeQty). Symbol flattened and locked until reconciliation."
         )
+    }
+
+    /**
+     * Phase 5 (§37): deterministic replay of the proactive pipeline over persisted
+     * candle history for the selected asset. `baseline = true` reruns it with the
+     * asymmetric overlay disabled to quantify the proactive edge.
+     */
+    fun runReplay(baseline: Boolean = false) {
+        val asset = _uiState.value.selectedAsset ?: return
+        if (_uiState.value.isReplayRunning) return
+        _uiState.value = _uiState.value.copy(isReplayRunning = true)
+        viewModelScope.launch {
+            try {
+                val timeframes = runCatching { universeScreener.loadTimeframes(asset.symbol) }.getOrNull()
+                val candles = timeframes?.candles1h.orEmpty()
+                if (candles.size < 30) {
+                    logLiveNote(
+                        "REPLAY",
+                        "REPLAY_INSUFFICIENT_DATA",
+                        "Replay needs >=30 persisted 1h candles for ${asset.symbol}; found ${candles.size}"
+                    )
+                    _uiState.value = _uiState.value.copy(isReplayRunning = false)
+                    return@launch
+                }
+                val calibration = runCatching { universeScreener.loadCalibration(asset) }.getOrNull()
+                var result = replayEngine.replay(
+                    asset = asset,
+                    candles = candles,
+                    fundingRatePct = asset.fundingRatePct,
+                    spreadPct = asset.orderBookSpreadPct,
+                    calibration = calibration,
+                    baselineMode = baseline
+                )
+                // §37: quantify the proactive edge against the symmetric-only baseline.
+                if (!baseline) {
+                    val symmetric = replayEngine.replay(
+                        asset = asset,
+                        candles = candles,
+                        fundingRatePct = asset.fundingRatePct,
+                        spreadPct = asset.orderBookSpreadPct,
+                        calibration = calibration,
+                        baselineMode = true
+                    )
+                    val base = symmetric.metrics.totalPnlUsd
+                    val edge = if (Math.abs(base) > 0.01) {
+                        (result.metrics.totalPnlUsd - base) / Math.abs(base) * 100.0
+                    } else 0.0
+                    result = result.copy(
+                        metrics = result.metrics.copy(proactiveEdgeVsBaselinePct = Math.round(edge * 10.0) / 10.0)
+                    )
+                }
+                _uiState.value = _uiState.value.copy(
+                    lastReplay = result,
+                    backtestMetrics = result.metrics,
+                    isReplayRunning = false
+                )
+                repository.logAction(
+                    asset = asset.symbol,
+                    campaignId = if (baseline) "REPLAY_BASELINE" else "REPLAY",
+                    action = AuditLogAction.CAMPAIGN_STAGED,
+                    reasonCode = "REPLAY_EXECUTED",
+                    message = "Historical replay over ${candles.size} 1h candles: ${result.metrics.replayedCampaigns} boards, " +
+                        "PnL $${result.metrics.totalPnlUsd}, miss rate ${result.metrics.orderMissRatePct}%"
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(isReplayRunning = false)
+                logLiveNote(
+                    "REPLAY",
+                    "REPLAY_FAILED",
+                    "Replay failed: ${e.message ?: e.javaClass.simpleName}"
+                )
+            }
+        }
     }
 
     private suspend fun logLiveNote(campaignId: String, reasonCode: String, message: String) {

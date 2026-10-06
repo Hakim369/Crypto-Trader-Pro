@@ -155,7 +155,10 @@ fun ProactiveMsApp(viewModel: MainViewModel = viewModel()) {
                     SimulationScreen(
                         metrics = uiState.backtestMetrics,
                         selectedScenario = uiState.selectedScenario,
-                        onRunScenario = { viewModel.runSimulationScenario(it) }
+                        onRunScenario = { viewModel.runSimulationScenario(it) },
+                        lastReplay = uiState.lastReplay,
+                        isReplayRunning = uiState.isReplayRunning,
+                        onRunReplay = { baseline -> viewModel.runReplay(baseline) }
                     )
                 }
 
