@@ -52,14 +52,17 @@ class UniverseScreener(private val candleDao: CandleDao) {
             val spotBases = async { BinanceFuturesClient.fetchSpotExchangeInfo() }
             val tickers = async { BinanceFuturesClient.fetch24hTickers() }
             val premiums = async { BinanceFuturesClient.fetchPremiumIndexes() }
-            val funding = async { CoinGlassClient.fetchFundingRates() }
-            val ois = async { CoinGlassClient.fetchOpenInterestUsd() }
-            val basis = async { CoinGlassClient.fetchBasis() }
+            val fundingDeferred = async { CoinGlassClient.fetchFundingRates() }
+            val oisDeferred = async { CoinGlassClient.fetchOpenInterestUsd() }
+            val basisDeferred = async { CoinGlassClient.fetchBasis() }
 
             val info = exchangeInfo.await() ?: return@coroutineScope emptyList()
             val spotBaseSet = spotBases.await().toSet()
             val tickerBySymbol = tickers.await().associateBy { it.symbol }
             val premiumBySymbol = premiums.await().associateBy { it.symbol }
+            val funding = fundingDeferred.await()
+            val ois = oisDeferred.await()
+            val basis = basisDeferred.await()
 
             val tradablePerps = info.symbols.filter {
                 it.status == "TRADING" &&

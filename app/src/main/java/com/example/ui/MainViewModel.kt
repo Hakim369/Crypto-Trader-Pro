@@ -41,7 +41,7 @@ import com.example.engine.OrderBookSnapshot
 import com.example.engine.OverrideWarning
 import com.example.engine.PathEngine
 import com.example.engine.ReplayEngine
-import com.example.engine.ReplayResult
+import com.example.engine.ReplayEngine.ReplayResult
 import com.example.engine.RiskEngine
 import com.example.engine.SessionSecurityManager
 import com.example.engine.SimulationHarness

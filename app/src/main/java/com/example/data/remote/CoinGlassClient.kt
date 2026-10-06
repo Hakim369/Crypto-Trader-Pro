@@ -45,7 +45,7 @@ object CoinGlassClient {
     suspend fun fetchFundingRates(): Map<String, Pair<Double, Double?>> = withContext(Dispatchers.IO) {
         val direct = getJson("$BASE/api/fundingRate/current")?.let { body ->
             parseRateList(body, rateKeyCandidates = listOf("rate", "currentFundingRate", "fundingRate"))
-        }
+        } ?: emptyMap()
         if (direct.isNotEmpty()) return@withContext direct
         // v2 fallback: /api/fundingRate/v2/current
         getJson("$BASE/api/fundingRate/v2/current")?.let { body ->
