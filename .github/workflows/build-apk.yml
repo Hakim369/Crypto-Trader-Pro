@@ -77,7 +77,6 @@ jobs:
           LICENSE_DIR="$ANDROID_HOME/licenses"
           mkdir -p "$LICENSE_DIR"
 
-          # Official Android SDK license hashes accepted by sdkmanager.
           write_license () {
             local file="$1"
             cat > "$file" <<'LICENSE'
@@ -111,7 +110,6 @@ LICENSE
         run: |
           set -euo pipefail
 
-          # .env is required by the Secrets Gradle Plugin.
           if [ ! -f .env ]; then
             if [ -f .env.example ]; then
               cp .env.example .env
@@ -120,19 +118,31 @@ LICENSE
             fi
           fi
 
-          # The project does not track gradlew or the wrapper jar, so regenerate
-          # a working wrapper from the committed wrapper properties.
           if [ ! -f gradlew ]; then
             if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
-              gradle wrapper --gradle-version 9.3.1 -p . >/dev/null
+              if ! gradle wrapper --gradle-version 9.3.1 -p .; then
+                echo "::warning::Could not generate gradlew wrapper from properties; falling back to system gradle."
+                wrapper_generated=false
+              else
+                wrapper_generated=true
+              fi
+            else
+              wrapper_generated=false
             fi
+          else
+            wrapper_generated=true
           fi
-          if [ -x gradlew ]; then
+
+          if [ "$wrapper_generated" != "true" ]; then
+            if ! command -v gradle >/dev/null 2>&1; then
+              echo "::error::No gradlew and no system gradle; cannot proceed."
+              exit 1
+            fi
+            echo "::info::Using system gradle because no local gradlew is available."
+          else
             chmod +x gradlew
           fi
 
-          # Debug keystore: decode if provided, otherwise generate the standard
-          # Android debug keystore (alias androiddebugkey, password android).
           if [ -s debug.keystore.base64 ]; then
             base64 -d debug.keystore.base64 > debug.keystore 2>/dev/null || true
           fi
@@ -150,9 +160,6 @@ LICENSE
               -dname "CN=Android Debug, O=Android, C=US"
           fi
 
-          # Release keystore: the project build file expects my-upload-key.jks
-          # with alias upload. Generate it automatically so release builds do not
-          # fail on runners with no configured signing secrets.
           if [ ! -s my-upload-key.jks ]; then
             keytool -genkeypair \
               -v \
@@ -166,9 +173,6 @@ LICENSE
               -dname "CN=AI Phone, OU=Engineering, O=AI Phone, L=Mountain View, ST=CA, C=US"
           fi
 
-          # Safe secret handling: never inject empty GitHub secrets into step
-          # `env:`. Resolve them inside the bash script so unconfigured secrets
-          # stay unset and fall back to provisioned defaults.
           SECRET_KEYSTORE="${{ secrets.KEYSTORE_PATH }}"
           if [ -n "$SECRET_KEYSTORE" ] && [ -f "$SECRET_KEYSTORE" ]; then
             export KEYSTORE_PATH="$SECRET_KEYSTORE"
@@ -191,7 +195,6 @@ LICENSE
           echo "HAS_RELEASE_KEYSTORE=$([ -s my-upload-key.jks ] && echo true || echo false)"
           echo "::endgroup::"
 
-          # Persist resolved values for later steps.
           printf 'export KEYSTORE_PATH=%q\n' "$KEYSTORE_PATH" > build-env.sh
           printf 'export STORE_PASSWORD=%q\n' "$STORE_PASSWORD" >> build-env.sh
           printf 'export KEY_PASSWORD=%q\n' "$KEY_PASSWORD" >> build-env.sh
@@ -210,14 +213,13 @@ LICENSE
             source build-env.sh
           fi
 
-          GRADLE=(./gradlew)
-          if [ ! -x ./gradlew ]; then
-            if command -v gradle >/dev/null 2>&1; then
-              GRADLE=(gradle)
-            else
-              echo "::error::No gradlew and no system gradle; cannot run tests."
-              exit 1
-            fi
+          if [ -x ./gradlew ]; then
+            GRADLE=(./gradlew)
+          elif command -v gradle >/dev/null 2>&1; then
+            GRADLE=(gradle)
+          else
+            echo "::error::No gradlew and no system gradle; cannot run tests."
+            exit 1
           fi
 
           "${GRADLE[@]}" :app:testDebugUnitTest --continue --stacktrace
@@ -264,14 +266,13 @@ LICENSE
             source build-env.sh
           fi
 
-          GRADLE=(./gradlew)
-          if [ ! -x ./gradlew ]; then
-            if command -v gradle >/dev/null 2>&1; then
-              GRADLE=(gradle)
-            else
-              echo "::error::No gradlew and no system gradle; cannot build."
-              exit 1
-            fi
+          if [ -x ./gradlew ]; then
+            GRADLE=(./gradlew)
+          elif command -v gradle >/dev/null 2>&1; then
+            GRADLE=(gradle)
+          else
+            echo "::error::No gradlew and no system gradle; cannot build."
+            exit 1
           fi
 
           case "$BUILD_TYPE" in
