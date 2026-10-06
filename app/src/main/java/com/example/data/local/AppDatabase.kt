@@ -9,15 +9,17 @@ import androidx.room.RoomDatabase
     entities = [
         AssetEntity::class,
         CampaignEntity::class,
-        AuditTrailEntity::class
+        AuditTrailEntity::class,
+        CandleEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun assetDao(): AssetDao
     abstract fun campaignDao(): CampaignDao
     abstract fun auditTrailDao(): AuditTrailDao
+    abstract fun candleDao(): CandleDao
 
     companion object {
         @Volatile

@@ -39,13 +39,27 @@ android {
   }
 
   buildTypes {
+    // Optional CoinGlass API key, sourced from .env (secrets convention) or the
+    // process environment. Empty default = anonymous CoinGlass access.
+    val coinglassKey =
+        (System.getenv("COINGLASS_API_KEY")
+            ?: rootProject.file(".env").takeIf { it.exists() }
+                ?.readLines()
+                ?.firstOrNull { it.trimStart().startsWith("COINGLASS_API_KEY=") }
+                ?.substringAfter('=')?.trim())
+            ?: ""
+
     release {
       isCrunchPngs = false
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfig = signingConfigs.getByName("release")
+      buildConfigField("String", "COINGLASS_API_KEY", "\"$coinglassKey\"")
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug {
+      signingConfig = signingConfigs.getByName("debugConfig")
+      buildConfigField("String", "COINGLASS_API_KEY", "\"$coinglassKey\"")
+    }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
@@ -68,6 +82,9 @@ secrets {
   propertiesFileName = ".env"
   defaultPropertiesFileName = ".env.example"
   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
+  // CoinGlass key is consumed in code via BuildConfig (not the manifest), so it must
+  // not be treated as a manifest placeholder.
+  ignoreList.add("COINGLASS_API_KEY")
 }
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }

@@ -3,6 +3,7 @@ package com.example.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.BuildConfig
 import com.example.data.local.AppDatabase
 import com.example.data.local.AssetEntity
 import com.example.data.local.CampaignEntity
@@ -20,11 +21,13 @@ import com.example.data.model.ExecutionMode
 import com.example.data.model.LevelMap
 import com.example.data.model.RiskEnvelope
 import com.example.data.model.VenueHealth
+import com.example.data.remote.CoinGlassClient
 import com.example.engine.CampaignEngine
 import com.example.engine.FeatureEngine
 import com.example.engine.HardwareDiagnosticsProvider
 import com.example.engine.InvalidationAction
 import com.example.engine.InvalidationEngine
+import com.example.engine.LiveMarketDataProvider
 import com.example.engine.MarketDataRepository
 import com.example.engine.OrphanInterceptDecision
 import com.example.engine.OrphanInterceptPolicy
@@ -35,6 +38,7 @@ import com.example.engine.RiskEngine
 import com.example.engine.SessionSecurityManager
 import com.example.engine.SimulationHarness
 import com.example.engine.SimulationScenario
+import com.example.engine.UniverseScreener
 import com.example.engine.StructureEngine
 import com.example.engine.TakerTrade
 import kotlinx.coroutines.Job
@@ -66,8 +70,10 @@ data class MainUiState(
     /** True while a pre-flight hardware/network diagnostics sample is being taken (Spec §2). */
     val isDiagnosticsRunning: Boolean = false,
     /** True once a real diagnostics sample has populated venueHealth (vs. built-in defaults). */
-    val hasLiveDiagnostics: Boolean = false
-)
+    val hasLiveDiagnostics: Boolean = false,
+    /** True when the current universe came from live exchange discovery (vs offline seed). */
+    val isLiveUniverse: Boolean = false
+ )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -75,6 +81,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = DatabaseRepository(db)
 
     private val marketDataRepo = MarketDataRepository()
+    private val universeScreener = UniverseScreener(db.candleDao())
+    private val liveProvider = LiveMarketDataProvider(universeScreener)
     private val featureEngine = FeatureEngine()
     private val structureEngine = StructureEngine()
     private val pathEngine = PathEngine(featureEngine)
@@ -96,14 +104,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var takerFlowJob: Job? = null
 
     init {
+        // Optional CoinGlass key from the secrets-managed environment (never persisted).
+        runCatching {
+            CoinGlassClient.apiKey = BuildConfig.COINGLASS_API_KEY
+        }
         loadInitialData()
         observeAuditLogs()
         runPreFlightDiagnostics()
+        startDormantUniversePolling()
     }
 
     private fun loadInitialData() {
+        // §5 Heavy Data: pull the real (or cached) universe in the background, but paint
+        // the UI immediately from the offline seed so first frame is never blank.
         val initialAssets = marketDataRepo.getInitialUniverse()
         val defaultAsset = initialAssets.first()
+
+        viewModelScope.launch {
+            val liveUniverse = runCatching { liveProvider.loadUniverseOnce() }
+                .getOrDefault(initialAssets)
+            val chosen = liveUniverse.firstOrNull() ?: defaultAsset
+            applyUniverseAndRecompute(liveUniverse, chosen)
+        }
 
         val map = structureEngine.buildLevelMap(defaultAsset)
         val candidatePaths = pathEngine.rankCandidatePaths(defaultAsset, map)
@@ -154,6 +176,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         startActiveDeltaMode(defaultAsset)
+    }
+
+    /** Applies a freshly-screened universe and recomputes analytics for the chosen symbol. */
+    private fun applyUniverseAndRecompute(universe: List<CryptoAsset>, chosen: CryptoAsset) {
+        val map = structureEngine.buildLevelMap(chosen)
+        val candidatePaths = pathEngine.rankCandidatePaths(chosen, map)
+        val campaigns = campaignEngine.planCampaigns(chosen, map, candidatePaths)
+        val evidence = liveProvider.buildEvidenceFrame(chosen)
+        _uiState.value = _uiState.value.copy(
+            assets = universe,
+            selectedAsset = chosen,
+            levelMap = map,
+            paths = candidatePaths,
+            campaigns = campaigns,
+            selectedCampaign = campaigns.firstOrNull(),
+            liveEvidence = evidence,
+            isLiveUniverse = universe.any { it.quoteVolume24h > 0 && it.orderBookSpreadPct < 100.0 }
+        )
+        startActiveDeltaMode(chosen)
     }
 
     private fun observeAuditLogs() {
@@ -225,7 +266,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val map = structureEngine.buildLevelMap(asset)
         val candidatePaths = pathEngine.rankCandidatePaths(asset, map)
         val planned = campaignEngine.planCampaigns(asset, map, candidatePaths)
-        val evidence = featureEngine.buildEvidenceFrame(asset)
+        val evidence = liveProvider.buildEvidenceFrame(asset)
 
         _uiState.value = _uiState.value.copy(
             selectedAsset = asset,
@@ -248,6 +289,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
     }
+
+    /** §5 Dormant Polling: refresh the screener universe on a light REST cadence. */
+    private fun startDormantUniversePolling() {
+        dormantPollingJob?.cancel()
+        dormantPollingJob = viewModelScope.launch {
+            liveProvider.dormantUniversePolling().collect { universe ->
+                val currentSymbol = _uiState.value.selectedAsset?.symbol
+                val chosen = universe.find { it.symbol == currentSymbol } ?: universe.firstOrNull()
+                if (chosen != null) {
+                    applyUniverseAndRecompute(universe, chosen)
+                }
+            }
+        }
+    }
+
+    private var dormantPollingJob: Job? = null
 
     fun selectCampaign(campaign: Campaign) {
         _uiState.value = _uiState.value.copy(selectedCampaign = campaign)
@@ -505,11 +562,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         orderBookJob?.cancel()
         takerFlowJob?.cancel()
 
-        // 1. Live price and micro-delta updates
+        // 1. Live price and micro-delta updates (real WS with simulated fallback)
         activeDeltaJob = viewModelScope.launch {
-            marketDataRepo.streamLiveTicks(asset).collect { updatedAsset ->
+            liveProvider.activeDeltaStream(asset).collect { updatedAsset ->
                 val currentLevelMap = _uiState.value.levelMap ?: structureEngine.buildLevelMap(updatedAsset)
-                val evidence = featureEngine.buildEvidenceFrame(updatedAsset)
+                val evidence = liveProvider.buildEvidenceFrame(updatedAsset)
 
                 // Run live invalidation evaluations across all staged/active campaigns
                 val updatedCampaigns = _uiState.value.campaigns.map { campaign ->
@@ -547,17 +604,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // 2. Order book stream
+        // 2. Order book stream (real best bid/ask with synthesized depth ladder)
         orderBookJob = viewModelScope.launch {
-            marketDataRepo.streamOrderBook(asset.symbol, asset.lastPrice, asset.atr5m).collect { ob ->
+            liveProvider.orderBookStream(asset).collect { ob ->
                 _uiState.value = _uiState.value.copy(orderBook = ob)
             }
         }
 
-        // 3. Taker trades stream
+        // 3. Taker trades stream (real aggTrade tape with simulated fallback)
         takerFlowJob = viewModelScope.launch {
             val list = mutableListOf<TakerTrade>()
-            marketDataRepo.streamTakerTrades(asset.lastPrice).collect { trade ->
+            liveProvider.takerTradeStream(asset).collect { trade ->
                 list.add(0, trade)
                 if (list.size > 20) list.removeAt(list.size - 1)
                 _uiState.value = _uiState.value.copy(takerTrades = list.toList())
@@ -570,6 +627,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         activeDeltaJob?.cancel()
         orderBookJob?.cancel()
         takerFlowJob?.cancel()
+        dormantPollingJob?.cancel()
         sessionManager.terminateSessionAndWipeRam()
     }
 }
