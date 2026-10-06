@@ -3,6 +3,7 @@ package com.example.engine
 import com.example.data.model.BoardRole
 import com.example.data.model.Campaign
 import com.example.data.model.CampaignFamily
+import com.example.data.model.CoinCalibration
 import com.example.data.model.CampaignState
 import com.example.data.model.CandidatePath
 import com.example.data.model.CryptoAsset
@@ -18,13 +19,16 @@ import kotlin.math.max
 class CampaignEngine {
 
     /**
-     * Generates all 6 symmetric campaign plans and assigns asymmetric board roles
+     * Generates all 6 symmetric campaign plans and assigns asymmetric board roles.
+     * When [calibration] is supplied (§10), target depth is stretched along the side the
+     * coin historically moves fastest.
      */
     fun planCampaigns(
         asset: CryptoAsset,
         levelMap: LevelMap,
         paths: List<CandidatePath>,
-        totalRiskBudgetUsd: Double = 1000.0
+        totalRiskBudgetUsd: Double = 1000.0,
+        calibration: CoinCalibration? = null
     ): List<Campaign> {
         val htfSupport = levelMap.zones.find { it.zoneType == ZoneType.HTF_SUPPORT }
         val htfResist = levelMap.zones.find { it.zoneType == ZoneType.HTF_RESISTANCE }
@@ -272,7 +276,64 @@ class CampaignEngine {
             )
         }
 
-        return campaigns.sortedByDescending { it.priorityScore }
+        // §15 Bias Score Model: bias bands modify priority, size multiplier, ladder
+        // aggressiveness, target depth and cancel sensitivity — reproducibly, in one place.
+        val biasAdjusted = campaigns.map { c ->
+            val band = directionalBand(asset, c.isLong)
+            val favored = (c.isLong && band.sizeAdj > 0) || (!c.isLong && band.sizeAdj < 0)
+            val opposed = (c.isLong && band.sizeAdj < 0) || (!c.isLong && band.sizeAdj > 0)
+            val sizeBudget = (c.sizeBudgetUsd * (1 + band.sizeAdj)).coerceAtLeast(0.0)
+            val ladder = reweightLadder(c.entryLadder, band.sizeAdj.coerceIn(-0.6, 0.6))
+            // §10 calibration extends target depth along the side the coin moves fastest.
+            val calibrationScale = when {
+                calibration == null -> 1.0
+                c.isLong -> calibration.impulseAsymmetry.coerceIn(0.7, 1.5)
+                else -> (1.0 / calibration.impulseAsymmetry).coerceIn(0.7, 1.5)
+            }
+            val depthScale = (1.0 + band.sizeAdj * 0.10) * calibrationScale
+            val targets = c.targets.mapIndexed { i, t ->
+                if (i == c.targets.lastIndex) t.copy(price = t.price * depthScale) else t
+            }
+            // Favored direction relaxes cancel sensitivity slightly; opposed tightens (§15).
+            val stopAdj = if (favored) 2 else if (opposed) -2 else 0
+            c.copy(
+                priorityScore = c.priorityScore + band.priorityAdj,
+                sizeBudgetUsd = sizeBudget,
+                entryLadder = ladder,
+                targets = targets,
+                stopLogic = c.stopLogic.copy(
+                    softThreshold = (c.stopLogic.softThreshold + stopAdj).coerceIn(10, 90),
+                    hardThreshold = (c.stopLogic.hardThreshold + stopAdj).coerceIn(20, 95)
+                )
+            )
+        }
+
+        return biasAdjusted.sortedByDescending { it.priorityScore }
+    }
+
+    /** §15: directional bias for a campaign side (bullish bias boosts longs, not shorts). */
+    private fun directionalBand(asset: CryptoAsset, isLong: Boolean): IndicatorMath.BiasBand =
+        IndicatorMath.BiasBand.of(if (isLong) asset.tacticalBias else -asset.tacticalBias)
+
+    /**
+     * §15 ladder aggressiveness: front-loads weight toward the near-price edge for the
+     * favored direction, pushes weight to the deeper exhaustion edge when opposed.
+     */
+    private fun reweightLadder(ladder: List<LadderSlice>, frontLoad: Double): List<LadderSlice> {
+        if (ladder.size != 3 || ladder.any { it.price <= 0.0 }) return ladder
+        val totalNotional = ladder.sumOf { it.notionalUsd }
+        if (totalNotional <= 0.0) return ladder
+        val w0 = (0.30 + 0.15 * frontLoad).coerceIn(0.10, 0.55)
+        val w1 = (0.35 - 0.075 * frontLoad).coerceIn(0.10, 0.55)
+        val w2 = (1.0 - w0 - w1).coerceIn(0.05, 0.80)
+        val weights = listOf(w0, w1, w2)
+        return ladder.mapIndexed { i, slice ->
+            val notional = Math.round(totalNotional * weights[i] * 100.0) / 100.0
+            slice.copy(
+                notionalUsd = notional,
+                qty = Math.round(notional / slice.price * 100.0) / 100.0
+            )
+        }
     }
 
     private fun determineBoardRoles(
@@ -383,7 +444,7 @@ class CampaignEngine {
                 qty = Math.round(qty * 100.0) / 100.0,
                 notionalUsd = Math.round(notional * 100.0) / 100.0,
                 orderType = orderType,
-                isFilled = (i == 0 && Math.random() > 0.65), // realistic occasional first-slice fill
+                isFilled = false, // fills arrive only from the execution/fill layer (§22, §25)
                 isResting = true
             )
         }

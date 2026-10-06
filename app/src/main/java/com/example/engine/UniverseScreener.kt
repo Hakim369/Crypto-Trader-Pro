@@ -2,6 +2,7 @@ package com.example.engine
 
 import com.example.data.local.CandleDao
 import com.example.data.local.CandleEntity
+import com.example.data.model.CoinCalibration
 import com.example.data.model.CryptoAsset
 import com.example.data.model.MarketRegime
 import com.example.data.remote.BinanceFuturesClient
@@ -90,9 +91,9 @@ class UniverseScreener(private val candleDao: CandleDao) {
                 val atr1h = atrFor(sym.symbol, "1h", lastPrice)
                 val atr4h = atrFor(sym.symbol, "4h", lastPrice)
 
-                // Deterministic interim bias from real 1h candles (Phase 3 supersedes).
-                val strategicBias = IndicatorMath.interimBias(loadCandles(sym.symbol, "4h", 60))
-                val tacticalBias = IndicatorMath.interimBias(loadCandles(sym.symbol, "1h", 60))
+                // §9/§15: structural + momentum multi-horizon bias from real candles.
+                val strategicBias = IndicatorMath.structuralBias(loadCandles(sym.symbol, "4h", 60))
+                val tacticalBias = IndicatorMath.structuralBias(loadCandles(sym.symbol, "1h", 60))
 
                 val regime = classifyRegime(strategicBias, tacticalBias)
                 val pain = IndicatorMath.painScore(fundingRate, tacticalBias)
@@ -130,6 +131,36 @@ class UniverseScreener(private val candleDao: CandleDao) {
             qualified
         }
     }
+
+    /** The three decision timeframes (§7) used by structure detection and calibration. */
+    data class TimeframeCandles(
+        val candles4h: List<BinanceFuturesClient.Candle>,
+        val candles1h: List<BinanceFuturesClient.Candle>,
+        val candles5m: List<BinanceFuturesClient.Candle>
+    )
+
+    /**
+     * Loads the HTF/MTF/LTF candle set for one symbol through the §5 Room-first cache.
+     * Used by the structure engine and calibration so analytics share one data path.
+     */
+    suspend fun loadTimeframes(symbol: String): TimeframeCandles = TimeframeCandles(
+        candles4h = loadCandles(symbol, "4h", 120),
+        candles1h = loadCandles(symbol, "1h", 120),
+        candles5m = loadCandles(symbol, "5m", 120)
+    )
+
+    /**
+     * §10 Coin-Specific Calibration computed from real 1h (behavior) and 5m (execution)
+     * history — retires the dead-model gap by making calibration a live screener output.
+     */
+    suspend fun loadCalibration(asset: CryptoAsset): CoinCalibration =
+        IndicatorMath.computeCalibration(
+            symbol = asset.symbol,
+            candles1h = loadCandles(asset.symbol, "1h", 120),
+            candles5m = loadCandles(asset.symbol, "5m", 120),
+            atr5m = asset.atr5m,
+            spreadPct = asset.orderBookSpreadPct
+        )
 
     /** §4: spread measured from a real L2 top-of-book snapshot; 100% when unavailable. */
     private suspend fun measureSpreadPct(symbol: String, mid: Double): Double {

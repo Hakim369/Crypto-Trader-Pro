@@ -15,6 +15,7 @@ import com.example.data.model.BoardRole
 import com.example.data.model.Campaign
 import com.example.data.model.CampaignState
 import com.example.data.model.CandidatePath
+import com.example.data.model.CoinCalibration
 import com.example.data.model.CryptoAsset
 import com.example.data.model.EvidenceFrame
 import com.example.data.model.ExecutionMode
@@ -51,6 +52,8 @@ data class MainUiState(
     val assets: List<CryptoAsset> = emptyList(),
     val selectedAsset: CryptoAsset? = null,
     val levelMap: LevelMap? = null,
+    /** §10 live per-coin calibration for the selected asset (null until candles load). */
+    val calibration: CoinCalibration? = null,
     val paths: List<CandidatePath> = emptyList(),
     val campaigns: List<Campaign> = emptyList(),
     val selectedCampaign: Campaign? = null,
@@ -179,10 +182,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Applies a freshly-screened universe and recomputes analytics for the chosen symbol. */
-    private fun applyUniverseAndRecompute(universe: List<CryptoAsset>, chosen: CryptoAsset) {
-        val map = structureEngine.buildLevelMap(chosen)
+    private suspend fun applyUniverseAndRecompute(universe: List<CryptoAsset>, chosen: CryptoAsset) {
+        // §8: build the level map from real swing structure when candle history exists;
+        // fall back to the ATR-offset synthesis only when no candles are available.
+        val timeframes = runCatching { universeScreener.loadTimeframes(chosen.symbol) }.getOrNull()
+        val map = if (timeframes != null && timeframes.candles1h.isNotEmpty()) {
+            structureEngine.buildLevelMap(
+                chosen,
+                timeframes.candles4h,
+                timeframes.candles1h,
+                timeframes.candles5m
+            )
+        } else {
+            structureEngine.buildLevelMap(chosen)
+        }
         val candidatePaths = pathEngine.rankCandidatePaths(chosen, map)
-        val campaigns = campaignEngine.planCampaigns(chosen, map, candidatePaths)
+        // §10: live per-coin calibration from real 1h/5m history.
+        val calibration = runCatching { universeScreener.loadCalibration(chosen) }.getOrNull()
+        val campaigns = campaignEngine.planCampaigns(chosen, map, candidatePaths, calibration = calibration)
         val evidence = liveProvider.buildEvidenceFrame(chosen)
         _uiState.value = _uiState.value.copy(
             assets = universe,
@@ -192,6 +209,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             campaigns = campaigns,
             selectedCampaign = campaigns.firstOrNull(),
             liveEvidence = evidence,
+            calibration = calibration,
             isLiveUniverse = universe.any { it.quoteVolume24h > 0 && it.orderBookSpreadPct < 100.0 }
         )
         startActiveDeltaMode(chosen)
@@ -278,6 +296,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
 
         startActiveDeltaMode(asset)
+
+        // Phase 3 (§8/§10): upgrade to the candle-driven level map + coin calibration
+        // once loaded; the synchronous paint above keeps first response instant.
+        viewModelScope.launch {
+            if (_uiState.value.selectedAsset?.symbol == asset.symbol) {
+                applyUniverseAndRecompute(_uiState.value.assets, asset)
+            }
+        }
 
         viewModelScope.launch {
             repository.logAction(
