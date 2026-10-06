@@ -310,10 +310,11 @@ class ReplayAndMigrationTest {
 
     @Test
     fun `swing points detect fractal extremes on a synthetic w-shape`() {
-        // low-high-low-high... sequence with flat runs between pivots.
+        // low-high-low-high... sequence with flat runs between pivots. Wick extremes
+        // equal the close so asserted pivot prices are exact.
         fun candleAt(price: Double, t: Long) = com.example.data.remote.BinanceFuturesClient.Candle(
-            openTimeUtcMs = t, open = price, high = price * 1.0001,
-            low = price * 0.9999, close = price, volume = 1.0,
+            openTimeUtcMs = t, open = price, high = price,
+            low = price, close = price, volume = 1.0,
             closeTimeUtcMs = t + 1, quoteVolume = price
         )
         val prices = listOf(100.0, 95.0, 100.0, 105.0, 100.0, 95.0, 100.0, 105.0, 100.0)
