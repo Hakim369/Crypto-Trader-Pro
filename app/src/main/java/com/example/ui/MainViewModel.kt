@@ -784,6 +784,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             state.venueHealth,
             sessionManager.hasValidActiveSession()
         )
+        val feedStale = ExecutionGuardrails.staleFeedAction(state.venueHealth) ==
+            ExecutionGuardrails.StaleFeedAction.SUPPRESS_AND_TRIM
+        val latencySpike = state.venueHealth.isLatencySpike
+        val spreadBlown = state.selectedAsset?.let { ExecutionGuardrails.isSpreadBlowout(it) } == true
         return gated.map { g ->
             var campaign = g.campaign
             var note = g.note
@@ -791,6 +795,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (ExecutionGuardrails.shouldPauseVenue(consecutiveRejectsBySymbol[campaign.asset] ?: 0)) {
                 campaign = campaign.copy(status = CampaignState.SUPPRESSED)
                 note = "Venue paused for ${campaign.asset}: order-reject threshold exceeded"
+            }
+            // §33: stale feed suppresses staging and cancels nonessential resting orders.
+            if (feedStale && campaign.status == CampaignState.STAGED) {
+                campaign = ExecutionGuardrails.trimNonessentialRestingOrders(listOf(campaign)).first()
+                note = "Data feed stale: staging suppressed, nonessential resting orders trimmed"
+            }
+            // §33: exchange latency spike pauses stop-entry arming (stop ladders stay down).
+            if (latencySpike && campaign.status == CampaignState.STAGED &&
+                campaign.entryLadder.any { it.orderType != OrderType.PASSIVE_LIMIT }
+            ) {
+                campaign = campaign.copy(status = CampaignState.SUPPRESSED)
+                note = "Exchange latency spike: stop-entry arming paused"
+            }
+            // §33: spread above the volatility-adjusted limit disables passive staging.
+            if (spreadBlown && campaign.status == CampaignState.STAGED &&
+                campaign.entryLadder.isNotEmpty() &&
+                campaign.entryLadder.all { it.orderType == OrderType.PASSIVE_LIMIT }
+            ) {
+                campaign = campaign.copy(status = CampaignState.SUPPRESSED)
+                note = "Spread exceeds volatility-adjusted limit: passive staging disabled"
             }
             if (note != null) {
                 viewModelScope.launch {
