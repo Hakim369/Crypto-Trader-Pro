@@ -1,6 +1,7 @@
 package com.example.engine
 
 import com.example.data.model.CryptoAsset
+import com.example.data.model.MarketRegime
 
 data class OrderBookLevel(val price: Double, val size: Double)
 data class OrderBookSnapshot(
