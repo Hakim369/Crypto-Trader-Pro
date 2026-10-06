@@ -15,6 +15,7 @@ import com.example.data.remote.BinanceFuturesClient
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.random.Random
 
 /**
  * Phase 5 (Spec §37): deterministic historical replay of the full proactive pipeline —
@@ -32,7 +33,8 @@ import kotlin.math.min
  */
 class ReplayEngine(
     private val invalidationEngine: InvalidationEngine = InvalidationEngine(),
-    private val executionEngine: ExecutionEngine = ExecutionEngine(RiskEngine())
+    private val executionEngine: ExecutionEngine = ExecutionEngine(RiskEngine()),
+    private val featureEngine: FeatureEngine = FeatureEngine(Random(0x501A5EEDL))
 ) {
 
     companion object {
@@ -151,7 +153,7 @@ class ReplayEngine(
             candles.takeLast(120),
             candles.takeLast(120)
         )
-        val paths = PathEngine(FeatureEngine()).rankCandidatePaths(candidate, map)
+        val paths = PathEngine(featureEngine).rankCandidatePaths(candidate, map)
         val planned = campaignEngineFor(candidate, map, paths, calibration, baselineMode)
         val tracked = planned.map { Tracked(it) }
 
@@ -230,14 +232,6 @@ class ReplayEngine(
         if (c.status == CampaignState.CANCELLED || c.status == CampaignState.COMPLETED ||
             c.status == CampaignState.SUPPRESSED || c.status == CampaignState.PLANNED
         ) return
-        val stopTriggered = c.entryLadder.any {
-            it.orderType != OrderType.PASSIVE_LIMIT && !it.isFilled &&
-                ((c.isLong && price >= it.price) || (!c.isLong && price <= it.price))
-        }
-        val touchedZone = c.entryLadder.any {
-            it.orderType == OrderType.PASSIVE_LIMIT && !it.isFilled &&
-                ((c.isLong && price <= it.price) || (!c.isLong && price >= it.price))
-        }
         val slip = max(1e-9, atrRef * 0.02)
         var changed = false
         val ladder = c.entryLadder.map { slice ->
@@ -432,7 +426,6 @@ class ReplayEngine(
                 )
             )
         }
-        val hardCount = replays.count { it.wasHardInvalidated }
         val fpCount = replays.count { it.falsePositiveInvalidation }
         val slowCount = replays.count { it.slowInvalidation }
         val invSpeeds = replays.filter { it.timeToInvalidationSec > 0 }.map { it.timeToInvalidationSec }

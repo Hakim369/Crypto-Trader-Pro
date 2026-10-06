@@ -5,25 +5,26 @@ import com.example.data.model.EvidenceFrame
 import kotlin.math.abs
 import kotlin.random.Random
 
-class FeatureEngine {
+class FeatureEngine(private val random: Random = Random.Default) {
 
     /**
-     * Builds live evidence frame for cancellation and monitoring
+     * Builds live evidence frame for cancellation and monitoring.
+     * The RNG is injectable so replay paths (Phase 5) stay deterministic.
      */
     fun buildEvidenceFrame(
         asset: CryptoAsset,
         recentPriceChangePct: Double = 0.05
     ): EvidenceFrame {
         // Evaluate OI delta vs price direction
-        val oiDelta = (Random.nextDouble(-1.2, 1.8))
-        val fundingDelta = (Random.nextDouble(-0.002, 0.002))
-        val basisDelta = (Random.nextDouble(-4.0, 5.5)) // bps
+        val oiDelta = (random.nextDouble(-1.2, 1.8))
+        val fundingDelta = (random.nextDouble(-0.002, 0.002))
+        val basisDelta = (random.nextDouble(-4.0, 5.5)) // bps
 
         // Taker buy ratio (> 0.5 taker aggressive buying, < 0.5 selling)
         val takerBuyRatio = when {
-            asset.tacticalBias > 40 -> Random.nextDouble(0.55, 0.78)
-            asset.tacticalBias < -40 -> Random.nextDouble(0.25, 0.48)
-            else -> Random.nextDouble(0.42, 0.58)
+            asset.tacticalBias > 40 -> random.nextDouble(0.55, 0.78)
+            asset.tacticalBias < -40 -> random.nextDouble(0.25, 0.48)
+            else -> random.nextDouble(0.42, 0.58)
         }
 
         val acceptanceQuality = if (asset.tacticalBias > 0) 0.72 else 0.38
