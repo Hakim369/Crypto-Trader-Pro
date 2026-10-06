@@ -11,59 +11,297 @@ on:
         options:
           - debug
           - release
+          - both
+      run_tests:
+        description: 'Run unit and Robolectric tests before building'
+        required: false
+        default: true
+        type: boolean
+
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '**.txt'
+
+concurrency:
+  group: build-apk-${{ github.ref }}-${{ github.event.inputs.build_type || 'push' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   build:
     name: Assemble Android APK
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      RAW_TYPE: ${{ github.event.inputs.build_type }}
+      BUILD_TYPE: ${{ env.RAW_TYPE || 'debug' }}
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
+          cache: 'gradle'
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
-          cache-read-only: false
 
-      - name: Ensure Build Environment Secrets & Keystore
+      - name: Accept Android SDK licenses
         run: |
+          set -euo pipefail
+
+          ANDROID_HOME=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
+          ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
+          export ANDROID_HOME ANDROID_SDK_ROOT
+
+          if [ ! -d "$ANDROID_HOME" ]; then
+            echo "::warning::ANDROID_HOME is not set; skipping Android SDK license acceptance."
+            exit 0
+          fi
+
+          LICENSE_DIR="$ANDROID_HOME/licenses"
+          mkdir -p "$LICENSE_DIR"
+
+          # Official Android SDK license hashes accepted by sdkmanager.
+          write_license () {
+            local file="$1"
+            cat > "$file" <<'LICENSE'
+8489d2d54414040913e779484694798b31d05e1e
+e6b7c2ab7fa2298c161305d457b7b25ef50c4a7b
+LICENSE
+          }
+
+          write_license "$LICENSE_DIR/android-sdk-license"
+          write_license "$LICENSE_DIR/android-sdk-preview-license"
+          write_license "$LICENSE_DIR/intel-android-sdk-license"
+          write_license "$LICENSE_DIR/intel-android-prebuilt-license"
+
+          for pkg in platforms; do
+            if [ -d "$ANDROID_HOME/$pkg" ]; then
+              pkg_license="$LICENSE_DIR/${pkg}-license"
+              if [ ! -f "$pkg_license" ]; then
+                touch "$pkg_license"
+              fi
+            fi
+          done
+
+          if command -v sdkmanager >/dev/null 2>&1; then
+            yes | sdkmanager --licenses || true
+          else
+            echo "::info::sdkmanager not on PATH; only license files were written."
+          fi
+        shell: bash
+
+      - name: Provision keystores and sanitise signing secrets
+        run: |
+          set -euo pipefail
+
+          # .env is required by the Secrets Gradle Plugin.
           if [ ! -f .env ]; then
-            touch .env
+            if [ -f .env.example ]; then
+              cp .env.example .env
+            else
+              touch .env
+            fi
           fi
-          if [ -f debug.keystore.base64 ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
-          elif [ ! -f debug.keystore ]; then
-            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+
+          # The project does not track gradlew or the wrapper jar, so regenerate
+          # a working wrapper from the committed wrapper properties.
+          if [ ! -f gradlew ]; then
+            if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+              gradle wrapper --gradle-version 9.3.1 -p . >/dev/null
+            fi
+          fi
+          if [ -x gradlew ]; then
+            chmod +x gradlew
           fi
 
-      - name: Assemble Debug APK
-        if: ${{ github.event.inputs.build_type == 'debug' }}
-        run: gradle :app:assembleDebug -Dorg.gradle.daemon=false -Dksp.daemon=false
+          # Debug keystore: decode if provided, otherwise generate the standard
+          # Android debug keystore (alias androiddebugkey, password android).
+          if [ -s debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore 2>/dev/null || true
+          fi
 
-      - name: Assemble Release APK
-        if: ${{ github.event.inputs.build_type == 'release' }}
-        run: gradle :app:assembleRelease -Dorg.gradle.daemon=false -Dksp.daemon=false
+          if [ ! -s debug.keystore ]; then
+            keytool -genkeypair \
+              -v \
+              -keystore debug.keystore \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android \
+              -keypass android \
+              -dname "CN=Android Debug, O=Android, C=US"
+          fi
 
-      - name: Upload Debug APK Artifact
-        if: ${{ github.event.inputs.build_type == 'debug' }}
+          # Release keystore: the project build file expects my-upload-key.jks
+          # with alias upload. Generate it automatically so release builds do not
+          # fail on runners with no configured signing secrets.
+          if [ ! -s my-upload-key.jks ]; then
+            keytool -genkeypair \
+              -v \
+              -keystore my-upload-key.jks \
+              -alias upload \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android \
+              -keypass android \
+              -dname "CN=AI Phone, OU=Engineering, O=AI Phone, L=Mountain View, ST=CA, C=US"
+          fi
+
+          # Safe secret handling: never inject empty GitHub secrets into step
+          # `env:`. Resolve them inside the bash script so unconfigured secrets
+          # stay unset and fall back to provisioned defaults.
+          SECRET_KEYSTORE="${{ secrets.KEYSTORE_PATH }}"
+          if [ -n "$SECRET_KEYSTORE" ] && [ -f "$SECRET_KEYSTORE" ]; then
+            export KEYSTORE_PATH="$SECRET_KEYSTORE"
+          else
+            export KEYSTORE_PATH="$GITHUB_WORKSPACE/my-upload-key.jks"
+          fi
+
+          SECRET_STORE_PASS="${{ secrets.STORE_PASSWORD }}"
+          export STORE_PASSWORD="${SECRET_STORE_PASS:-android}"
+
+          SECRET_KEY_PASS="${{ secrets.KEY_PASSWORD }}"
+          export KEY_PASSWORD="${SECRET_KEY_PASS:-android}"
+
+          echo "::group::Resolved build-time environment"
+          echo "BUILD_TYPE=${BUILD_TYPE}"
+          echo "KEYSTORE_PATH=${KEYSTORE_PATH}"
+          echo "STORE_PASSWORD=${STORE_PASSWORD}"
+          echo "KEY_PASSWORD=${KEY_PASSWORD}"
+          echo "HAS_DEBUG_KEYSTORE=$([ -s debug.keystore ] && echo true || echo false)"
+          echo "HAS_RELEASE_KEYSTORE=$([ -s my-upload-key.jks ] && echo true || echo false)"
+          echo "::endgroup::"
+
+          # Persist resolved values for later steps.
+          printf 'export KEYSTORE_PATH=%q\n' "$KEYSTORE_PATH" > build-env.sh
+          printf 'export STORE_PASSWORD=%q\n' "$STORE_PASSWORD" >> build-env.sh
+          printf 'export KEY_PASSWORD=%q\n' "$KEY_PASSWORD" >> build-env.sh
+          printf 'export BUILD_TYPE=%q\n' "$BUILD_TYPE" >> build-env.sh
+        shell: bash
+
+      - name: Run tests
+        if: github.event.inputs.run_tests != false
+        run: |
+          set -euo pipefail
+
+          RAW_TYPE="${{ github.event.inputs.build_type }}"
+          BUILD_TYPE="${RAW_TYPE:-debug}"
+
+          if [ -f build-env.sh ]; then
+            source build-env.sh
+          fi
+
+          GRADLE=(./gradlew)
+          if [ ! -x ./gradlew ]; then
+            if command -v gradle >/dev/null 2>&1; then
+              GRADLE=(gradle)
+            else
+              echo "::error::No gradlew and no system gradle; cannot run tests."
+              exit 1
+            fi
+          fi
+
+          "${GRADLE[@]}" :app:testDebugUnitTest --continue --stacktrace
+        shell: bash
+
+      - name: Ensure Gradle memory settings
+        run: |
+          set -euo pipefail
+
+          GRADLE_PROPERTIES=gradle.properties
+
+          if [ ! -f "$GRADLE_PROPERTIES" ]; then
+            touch "$GRADLE_PROPERTIES"
+          fi
+
+          ensure_line () {
+            local file="$1"
+            local key="$2"
+            local value="$3"
+            if grep -qE "^${key}=" "$file"; then
+              sed -i -e "s|^${key}=.*|${key}=${value}|" "$file"
+            else
+              printf '%s\n' "${key}=${value}" >> "$file"
+            fi
+          }
+
+          ensure_line "$GRADLE_PROPERTIES" "org.gradle.jvmargs" "-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC"
+          ensure_line "$GRADLE_PROPERTIES" "org.gradle.parallel" "true"
+          ensure_line "$GRADLE_PROPERTIES" "org.gradle.configuration-cache" "true"
+
+          echo "::group::gradle.properties after adjustment"
+          cat "$GRADLE_PROPERTIES"
+          echo "::endgroup::"
+        shell: bash
+
+      - name: Build APK
+        run: |
+          set -euo pipefail
+
+          RAW_TYPE="${{ github.event.inputs.build_type }}"
+          BUILD_TYPE="${RAW_TYPE:-debug}"
+
+          if [ -f build-env.sh ]; then
+            source build-env.sh
+          fi
+
+          GRADLE=(./gradlew)
+          if [ ! -x ./gradlew ]; then
+            if command -v gradle >/dev/null 2>&1; then
+              GRADLE=(gradle)
+            else
+              echo "::error::No gradlew and no system gradle; cannot build."
+              exit 1
+            fi
+          fi
+
+          case "$BUILD_TYPE" in
+            debug)
+              TASK=":app:assembleDebug"
+              ;;
+            release)
+              TASK=":app:assembleRelease"
+              ;;
+            both)
+              TASK=":app:assembleDebug :app:assembleRelease"
+              ;;
+            *)
+              echo "::error::Unknown BUILD_TYPE: $BUILD_TYPE (expected debug, release, or both)"
+              exit 1
+              ;;
+          esac
+
+          echo "::group::Invoking Gradle"
+          echo "Task: $TASK"
+          echo "JVM args: $(grep -E '^org.gradle.jvmargs=' gradle.properties || true)"
+          echo "::endgroup::"
+          "${GRADLE[@]}" $TASK --stacktrace
+        shell: bash
+
+      - name: Upload APK artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ProactiveMS-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 14
-
-      - name: Upload Release APK Artifact
-        if: ${{ github.event.inputs.build_type == 'release' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ProactiveMS-release-apk
-          path: app/build/outputs/apk/release/*.apk
-          retention-days: 14
+          name: ProactiveMS-${{ github.event.inputs.build_type || env.BUILD_TYPE || 'apk' }}-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
