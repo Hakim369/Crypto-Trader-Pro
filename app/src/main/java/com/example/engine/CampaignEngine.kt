@@ -18,6 +18,16 @@ import kotlin.math.max
 
 class CampaignEngine {
 
+    /** §12 mirror pairs: support↔resistance, reclaim↔fade, breakout↔breakdown. */
+    private val MIRROR_FAMILIES: Map<CampaignFamily, CampaignFamily> = mapOf(
+        CampaignFamily.SUPPORT_LONG to CampaignFamily.RESISTANCE_SHORT,
+        CampaignFamily.RESISTANCE_SHORT to CampaignFamily.SUPPORT_LONG,
+        CampaignFamily.RECLAIM_LONG to CampaignFamily.RECLAIM_FADE_SHORT,
+        CampaignFamily.RECLAIM_FADE_SHORT to CampaignFamily.RECLAIM_LONG,
+        CampaignFamily.BREAKOUT_LONG to CampaignFamily.BREAKDOWN_SHORT,
+        CampaignFamily.BREAKDOWN_SHORT to CampaignFamily.BREAKOUT_LONG
+    )
+
     /**
      * Generates all 6 symmetric campaign plans and assigns asymmetric board roles.
      * When [calibration] is supplied (§10), target depth is stretched along the side the
@@ -308,7 +318,14 @@ class CampaignEngine {
             )
         }
 
-        return biasAdjusted.sortedByDescending { it.priorityScore }
+        // §12 mirror rules: link every board to its structural mirror so §28 mirror
+        // invalidation and mirror-activation can route deterministically.
+        val idByFamily = biasAdjusted.associate { it.family to it.id }
+        val withMirrors = biasAdjusted.map { c ->
+            val mirrorId = MIRROR_FAMILIES[c.family]?.let { idByFamily[it] }
+            if (mirrorId != null && mirrorId != c.id) c.copy(mirrorCampaignId = mirrorId) else c
+        }
+        return withMirrors.sortedByDescending { it.priorityScore }
     }
 
     /** §15: directional bias for a campaign side (bullish bias boosts longs, not shorts). */

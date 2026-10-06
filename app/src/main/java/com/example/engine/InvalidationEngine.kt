@@ -166,6 +166,27 @@ class InvalidationEngine {
             )
         }
 
+        // 6. Time invalidation (§28): stagnant inside the zone beyond the campaign time
+        // budget — the pain-path hypothesis decayed without either trigger printing.
+        if (campaign.entryLadder.none { it.isFilled }) {
+            val elapsedMinutes = (System.currentTimeMillis() - campaign.createdAt) / 60_000
+            val budgetMinutes = timeBudgetMinutes(campaign)
+            val lowestEntry = campaign.entryLadder.minOfOrNull { it.price } ?: 0.0
+            val highestEntry = campaign.entryLadder.maxOfOrNull { it.price } ?: 0.0
+            val stagnantInsideZone = currentPrice in lowestEntry..highestEntry
+            if (elapsedMinutes > budgetMinutes && stagnantInsideZone) {
+                val pts = 20
+                score += pts
+                reasons.add(
+                    InvalidationReason(
+                        InvalidationFamily.TIME_EXPIRATION,
+                        pts,
+                        "Stagnant inside zone for ${elapsedMinutes}m (budget ${budgetMinutes}m); pain-path hypothesis decayed"
+                    )
+                )
+            }
+        }
+
         val totalScore = score.coerceIn(5, 100)
 
         // Action Decision Matrix
@@ -211,5 +232,74 @@ class InvalidationEngine {
             )
         }
         return campaign
+    }
+
+    /**
+     * §26 Rearm: after the cooldown lapses, the same family may be re-staged at the same
+     * level only if the level is still detected near the original ladder and the board
+     * was cancelled with nothing filled (no orphaned position to re-protect).
+     */
+    fun evaluateRearm(
+        campaign: Campaign,
+        levelMap: LevelMap,
+        asset: CryptoAsset,
+        nowTs: Long = System.currentTimeMillis()
+    ): InvalidationResult {
+        val eligible = campaign.status == CampaignState.CANCELLED &&
+            nowTs >= campaign.cooldownUntilTs &&
+            campaign.entryLadder.none { it.isFilled }
+        if (!eligible) {
+            return InvalidationResult(campaign, InvalidationAction.NO_ACTION, "Rearm conditions unmet")
+        }
+        val ladderCenter = campaign.entryLadder.map { it.price }.average()
+        val atr = asset.atr5m.coerceAtLeast(1e-9)
+        val zoneStillValid = levelMap.zones.any { abs(it.center - ladderCenter) <= atr * 0.5 }
+        if (!zoneStillValid) {
+            return InvalidationResult(
+                campaign,
+                InvalidationAction.NO_ACTION,
+                "Original level no longer detected; rearm denied"
+            )
+        }
+        val rearmed = campaign.copy(
+            status = CampaignState.STAGED,
+            invalidationScore = 12,
+            topReasons = emptyList(),
+            entryLadder = campaign.entryLadder.map { it.copy(isFilled = false, isResting = true) },
+            cooldownUntilTs = 0L,
+            createdAt = nowTs
+        )
+        return InvalidationResult(
+            rearmed,
+            InvalidationAction.REARM_CAMPAIGN,
+            "Level re-detected after cooldown; board re-armed at same family"
+        )
+    }
+
+    /**
+     * §28 mirror activation: when a campaign hard-invalidates (trap/rejection), its
+     * mirrored family wakes from SUPPRESSED as a defensive board — the mirrored
+     * hypothesis is now live and must be proactively armed.
+     */
+    fun activateMirrorOnTrap(campaign: Campaign, mirror: Campaign): Campaign? {
+        val trigger = campaign.status == CampaignState.CANCELLED &&
+            campaign.invalidationScore >= campaign.stopLogic.hardThreshold
+        val mirrorSuppressed = mirror.status == CampaignState.SUPPRESSED
+        return if (trigger && mirrorSuppressed) {
+            mirror.copy(
+                role = BoardRole.DEFENSIVE,
+                status = CampaignState.STAGED,
+                sizeMultiplier = 0.5,
+                priorityScore = mirror.priorityScore + 10.0
+            )
+        } else null
+    }
+
+    /** §29: tactical boards hold tighter than strategic; defensive boards fastest. */
+    private fun timeBudgetMinutes(campaign: Campaign): Long = when (campaign.role) {
+        BoardRole.PRIMARY -> 240L
+        BoardRole.SECONDARY -> 180L
+        BoardRole.DEFENSIVE -> 90L
+        BoardRole.DISABLED -> 60L
     }
 }

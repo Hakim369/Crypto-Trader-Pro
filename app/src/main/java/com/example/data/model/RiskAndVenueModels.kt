@@ -16,7 +16,8 @@ data class RiskEnvelope(
     val dailyLossLimitR: Double = 2.0,     // 1.5R to 2.0R daily stop
     val currentRealizedLossR: Double = 0.0,
     val worstCaseStopOutR: Double = 0.85,  // Worst case concurrent stop-out visible at all times
-    val isKillSwitchEngaged: Boolean = false
+    val isKillSwitchEngaged: Boolean = false,
+    val cappedNotionalPerCampaignUsd: Double = 250.0 // Capped Live per-board clip (§36)
 ) {
     val isDailyLossExceeded: Boolean get() = currentRealizedLossR >= dailyLossLimitR
 }

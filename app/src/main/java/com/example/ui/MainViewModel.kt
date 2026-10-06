@@ -20,10 +20,15 @@ import com.example.data.model.CryptoAsset
 import com.example.data.model.EvidenceFrame
 import com.example.data.model.ExecutionMode
 import com.example.data.model.LevelMap
+import com.example.data.model.OrderType
 import com.example.data.model.RiskEnvelope
 import com.example.data.model.VenueHealth
+import com.example.data.remote.BinanceSignedClient
+import com.example.data.remote.BinanceUserDataClient
 import com.example.data.remote.CoinGlassClient
 import com.example.engine.CampaignEngine
+import com.example.engine.ExecutionEngine
+import com.example.engine.ExecutionGuardrails
 import com.example.engine.FeatureEngine
 import com.example.engine.HardwareDiagnosticsProvider
 import com.example.engine.InvalidationAction
@@ -47,6 +52,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.util.Arrays
 
 data class MainUiState(
     val assets: List<CryptoAsset> = emptyList(),
@@ -94,6 +100,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val riskEngine = RiskEngine()
     private val sessionManager = SessionSecurityManager()
     private val simulationHarness = SimulationHarness()
+
+    /** Phase 4 (§36): execution gate + live order routing state. */
+    private val executionEngine = ExecutionEngine(riskEngine)
+    private val consecutiveRejectsBySymbol = mutableMapOf<String, Int>()
+    private var userDataJob: Job? = null
+    private var lastPositionCheckMs = 0L
+    private val routedClientIds = mutableSetOf<String>()
 
     /** Phase 1 (Spec §2): real OS diagnostics; no-arg constructor stays test-friendly. */
     private val diagnosticsProvider: HardwareDiagnosticsProvider? =
@@ -199,19 +212,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val candidatePaths = pathEngine.rankCandidatePaths(chosen, map)
         // §10: live per-coin calibration from real 1h/5m history.
         val calibration = runCatching { universeScreener.loadCalibration(chosen) }.getOrNull()
-        val campaigns = campaignEngine.planCampaigns(chosen, map, candidatePaths, calibration = calibration)
+        val planned = campaignEngine.planCampaigns(chosen, map, candidatePaths, calibration = calibration)
         val evidence = liveProvider.buildEvidenceFrame(chosen)
+        // Phase 4: preserve reconciled fills, then run the staging gate (§22 step 7, §36).
+        val merged = mergeFillState(planned, _uiState.value.campaigns)
+        val gatedCampaigns = gateAndLog(merged)
         _uiState.value = _uiState.value.copy(
             assets = universe,
             selectedAsset = chosen,
             levelMap = map,
             paths = candidatePaths,
-            campaigns = campaigns,
-            selectedCampaign = campaigns.firstOrNull(),
+            campaigns = gatedCampaigns,
+            selectedCampaign = gatedCampaigns.firstOrNull(),
             liveEvidence = evidence,
             calibration = calibration,
             isLiveUniverse = universe.any { it.quoteVolume24h > 0 && it.orderBookSpreadPct < 100.0 }
         )
+        routeLiveBoards(gatedCampaigns)
+        startUserDataStreamIfNeeded()
         startActiveDeltaMode(chosen)
     }
 
@@ -285,13 +303,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val candidatePaths = pathEngine.rankCandidatePaths(asset, map)
         val planned = campaignEngine.planCampaigns(asset, map, candidatePaths)
         val evidence = liveProvider.buildEvidenceFrame(asset)
+        val gatedPlanned = gateAndLog(mergeFillState(planned, _uiState.value.campaigns))
 
         _uiState.value = _uiState.value.copy(
             selectedAsset = asset,
             levelMap = map,
             paths = candidatePaths,
-            campaigns = planned,
-            selectedCampaign = planned.firstOrNull(),
+            campaigns = gatedPlanned,
+            selectedCampaign = gatedPlanned.firstOrNull(),
             liveEvidence = evidence
         )
 
@@ -346,6 +365,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 reasonCode = "MODE_CHANGED",
                 message = "Operational mode changed to ${mode.displayName}"
             )
+            // §36: re-gate boards under the new mode and adjust live plumbing.
+            val regated = gateAndLog(_uiState.value.campaigns)
+            _uiState.value = _uiState.value.copy(campaigns = regated)
+            if (mode == ExecutionMode.CAPPED_LIVE || mode == ExecutionMode.SCALED_LIVE) {
+                routeLiveBoards(regated)
+                startUserDataStreamIfNeeded()
+            } else {
+                userDataJob?.cancel()
+                userDataJob = null
+            }
         }
     }
 
@@ -361,6 +390,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } else _uiState.value.campaigns
         )
+        if (updated) {
+            // §22/§27: engagement is not just local — pull every venue order too.
+            viewModelScope.launch {
+                val creds = sessionManager.copyCredentials()
+                if (creds != null) {
+                    val symbol = _uiState.value.selectedAsset?.symbol
+                    if (!symbol.isNullOrEmpty()) {
+                        BinanceSignedClient.cancelAllOpenOrders(symbol, creds.first, creds.second)
+                    }
+                    Arrays.fill(creds.first, '\u0000')
+                    Arrays.fill(creds.second, '\u0000')
+                }
+                userDataJob?.cancel()
+                userDataJob = null
+                routedClientIds.clear()
+            }
+        }
 
         viewModelScope.launch {
             repository.logAction(
@@ -591,6 +637,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 1. Live price and micro-delta updates (real WS with simulated fallback)
         activeDeltaJob = viewModelScope.launch {
             liveProvider.activeDeltaStream(asset).collect { updatedAsset ->
+                val previousCampaigns = _uiState.value.campaigns
                 val currentLevelMap = _uiState.value.levelMap ?: structureEngine.buildLevelMap(updatedAsset)
                 val evidence = liveProvider.buildEvidenceFrame(updatedAsset)
 
@@ -615,18 +662,95 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     result.updatedCampaign
                 }
 
+                // §36 Paper mode: internal fill simulation of resting slices vs live price.
+                var working = updatedCampaigns
+                if (_uiState.value.executionMode == ExecutionMode.PAPER) {
+                    working = working.map { c ->
+                        val filled = executionEngine.simulatePaperFills(c, updatedAsset.lastPrice)
+                        if (filled != c) {
+                            repository.logAction(
+                                asset = c.asset,
+                                campaignId = c.id,
+                                action = AuditLogAction.SLICE_FILLED,
+                                reasonCode = "PAPER_FILL",
+                                message = "${c.family.displayName}: slice filled internally at ${updatedAsset.lastPrice}"
+                            )
+                        }
+                        filled
+                    }
+                }
+
+                // §26 Board promotion: a dead primary upgrades healthy secondaries.
+                val primaryDied = previousCampaigns.any { prior ->
+                    prior.role == BoardRole.PRIMARY &&
+                        prior.status != CampaignState.CANCELLED &&
+                        working.find { it.id == prior.id }?.status == CampaignState.CANCELLED
+                }
+                if (primaryDied) {
+                    working = working.map { c ->
+                        val promoted = invalidationEngine.checkBoardPromotion(c, isPrimaryDead = true)
+                        if (promoted != c) {
+                            repository.logAction(
+                                asset = c.asset,
+                                campaignId = c.id,
+                                action = AuditLogAction.BOARD_PROMOTED,
+                                reasonCode = "SECONDARY_PROMOTED",
+                                message = "${c.family.displayName} promoted to Primary after primary board decayed"
+                            )
+                        }
+                        promoted
+                    }
+                }
+
+                // §26 Rearm: cooldown lapsed and the level still exists -> re-arm.
+                val envelopeAllowsRearm = !_uiState.value.riskEnvelope.isKillSwitchEngaged &&
+                    !_uiState.value.riskEnvelope.isDailyLossExceeded
+                if (envelopeAllowsRearm) {
+                    working = working.map { c ->
+                        val rearm = invalidationEngine.evaluateRearm(c, currentLevelMap, updatedAsset)
+                        if (rearm.triggerAction == InvalidationAction.REARM_CAMPAIGN) {
+                            repository.logAction(
+                                asset = c.asset,
+                                campaignId = c.id,
+                                action = AuditLogAction.CAMPAIGN_STAGED,
+                                reasonCode = "REARM_CAMPAIGN",
+                                message = "${c.family.displayName}: ${rearm.primaryReason}"
+                            )
+                        }
+                        rearm.updatedCampaign
+                    }
+                }
+
+                // §28 Mirror activation: a hard-invalidated board wakes its suppressed mirror.
+                working = working.map { c ->
+                    val mirrorId = c.mirrorCampaignId ?: return@map c
+                    val mirror = working.find { it.id == mirrorId } ?: return@map c
+                    val activated = invalidationEngine.activateMirrorOnTrap(c, mirror) ?: return@map c
+                    repository.logAction(
+                        asset = activated.asset,
+                        campaignId = activated.id,
+                        action = AuditLogAction.DEFENSIVE_SCALED,
+                        reasonCode = "MIRROR_ACTIVATED",
+                        message = "${activated.family.displayName} activated defensively after mirror hard invalidation"
+                    )
+                    activated
+                }
+
                 val worstCaseR = riskEngine.computeWorstCaseStopOutR(
-                    updatedCampaigns,
+                    working,
                     _uiState.value.riskEnvelope.accountEquityUsd
                 )
 
                 _uiState.value = _uiState.value.copy(
                     selectedAsset = updatedAsset,
                     liveEvidence = evidence,
-                    campaigns = updatedCampaigns,
-                    selectedCampaign = updatedCampaigns.find { it.id == _uiState.value.selectedCampaign?.id } ?: updatedCampaigns.firstOrNull(),
+                    campaigns = working,
+                    selectedCampaign = working.find { it.id == _uiState.value.selectedCampaign?.id } ?: working.firstOrNull(),
                     riskEnvelope = _uiState.value.riskEnvelope.copy(worstCaseStopOutR = worstCaseR)
                 )
+
+                // §22/§33: push cancellations to the venue and reconcile the live position.
+                handleLiveExecution(previousCampaigns, updatedAsset)
             }
         }
 
@@ -648,12 +772,260 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ------------------------------------------------------------- Phase 4 execution
+
+    /** Runs the staging gate (risk validation + ExecutionMode + §33 rejects), logging notes. */
+    private fun gateAndLog(campaigns: List<Campaign>): List<Campaign> {
+        val state = _uiState.value
+        val gated = executionEngine.gateStaging(
+            campaigns,
+            state.executionMode,
+            state.riskEnvelope,
+            state.venueHealth,
+            sessionManager.hasValidActiveSession()
+        )
+        return gated.map { g ->
+            var campaign = g.campaign
+            var note = g.note
+            // §33: order-reject threshold pauses staging for that asset.
+            if (ExecutionGuardrails.shouldPauseVenue(consecutiveRejectsBySymbol[campaign.asset] ?: 0)) {
+                campaign = campaign.copy(status = CampaignState.SUPPRESSED)
+                note = "Venue paused for ${campaign.asset}: order-reject threshold exceeded"
+            }
+            if (note != null) {
+                viewModelScope.launch {
+                    repository.logAction(
+                        asset = campaign.asset,
+                        campaignId = campaign.id,
+                        action = AuditLogAction.CAMPAIGN_STAGED,
+                        reasonCode = "STAGING_GATE_${state.executionMode.name}",
+                        message = "${campaign.family.displayName}: $note"
+                    )
+                }
+            }
+            campaign
+        }
+    }
+
+    /** Preserves exchange/paper-reconciled fill state across level-map recomputes (§33). */
+    private fun mergeFillState(fresh: List<Campaign>, previous: List<Campaign>): List<Campaign> =
+        fresh.map { c ->
+            val prior = previous.find { it.id == c.id }
+            if (prior == null || prior.entryLadder.none { it.isFilled }) {
+                c
+            } else {
+                val mergedLadder = c.entryLadder.map { slice ->
+                    val priorSlice = prior.entryLadder.find { it.sliceIndex == slice.sliceIndex }
+                    if (priorSlice != null && priorSlice.isFilled) {
+                        slice.copy(isFilled = true, isResting = false)
+                    } else slice
+                }
+                val anyFilled = mergedLadder.any { it.isFilled }
+                c.copy(
+                    entryLadder = mergedLadder,
+                    status = if (anyFilled) executionEngine.statusAfterFills(mergedLadder) else c.status
+                )
+            }
+        }
+
+    /** §22/§36: routes resting slices to the venue for live modes with a valid session. */
+    private suspend fun routeLiveBoards(campaigns: List<Campaign>) {
+        val mode = _uiState.value.executionMode
+        if (mode != ExecutionMode.CAPPED_LIVE && mode != ExecutionMode.SCALED_LIVE) return
+        if (!sessionManager.hasValidActiveSession()) return
+        val toRoute = campaigns.filter { it.status == CampaignState.STAGED }
+        if (toRoute.isEmpty()) return
+        val creds = sessionManager.copyCredentials() ?: return
+        var rejects = 0
+        try {
+            for (campaign in toRoute) {
+                for (slice in campaign.entryLadder) {
+                    if (!slice.isResting || slice.isFilled) continue
+                    val clientId = executionEngine.clientOrderId(campaign.id, slice.sliceIndex)
+                    if (!routedClientIds.add(clientId)) continue
+                    val result = BinanceSignedClient.placeOrder(
+                        symbol = campaign.asset,
+                        side = if (campaign.isLong) "BUY" else "SELL",
+                        orderType = if (slice.orderType == OrderType.PASSIVE_LIMIT) "LIMIT" else "STOP",
+                        qty = slice.qty,
+                        price = slice.price,
+                        stopPrice = if (slice.orderType == OrderType.PASSIVE_LIMIT) null else slice.price,
+                        clientOrderId = clientId,
+                        apiKey = creds.first,
+                        secret = creds.second
+                    )
+                    if (result.ok) {
+                        logLiveNote(
+                            campaign.id,
+                            "ORDER_PLACED",
+                            "${campaign.family.displayName} slice ${slice.sliceIndex} routed at ${slice.price}"
+                        )
+                    } else {
+                        rejects++
+                        routedClientIds.remove(clientId)
+                        logLiveNote(
+                            campaign.id,
+                            "ORDER_REJECTED",
+                            "${campaign.family.displayName} slice ${slice.sliceIndex} rejected: ${result.message ?: "unknown"}"
+                        )
+                    }
+                }
+            }
+        } finally {
+            Arrays.fill(creds.first, '\u0000')
+            Arrays.fill(creds.second, '\u0000')
+        }
+        consecutiveRejectsBySymbol[campaigns.first().asset] =
+            if (rejects > 0) (consecutiveRejectsBySymbol[campaigns.first().asset] ?: 0) + rejects else 0
+    }
+
+    /** §25: opens the user-data stream so exchange fills reconcile onto ladder slices. */
+    private fun startUserDataStreamIfNeeded() {
+        val mode = _uiState.value.executionMode
+        if (mode != ExecutionMode.CAPPED_LIVE && mode != ExecutionMode.SCALED_LIVE) return
+        if (!sessionManager.hasValidActiveSession()) return
+        if (userDataJob != null) return
+        userDataJob = viewModelScope.launch {
+            val creds = sessionManager.copyCredentials()
+            if (creds == null) return@launch
+            val listenKey = BinanceSignedClient.createListenKey(creds.first)
+            Arrays.fill(creds.first, '\u0000')
+            Arrays.fill(creds.second, '\u0000')
+            if (listenKey == null) {
+                logLiveNote(
+                    "PORTFOLIO",
+                    "USER_STREAM_FAILED",
+                    "Listen key request failed; fills reconcile on next open-order snapshot"
+                )
+                return@launch
+            }
+            logLiveNote("PORTFOLIO", "USER_STREAM_OPEN", "User-data stream connected for fill reconciliation")
+            BinanceUserDataClient.streamUserEvents(listenKey).collect { event ->
+                handleFillEvent(event)
+            }
+        }
+    }
+
+    /** §22/§25: applies one exchange order event onto the matching campaign ladder. */
+    private suspend fun handleFillEvent(event: BinanceUserDataClient.FillEvent) {
+        val current = _uiState.value.campaigns
+        val target = current.find { event.clientOrderId.startsWith(it.id) } ?: return
+        val updated = when {
+            event.isFill -> executionEngine.reconcileFill(target, event.clientOrderId)
+            event.isTerminalCancel -> executionEngine.reconcileCancel(target, event.clientOrderId)
+            else -> return
+        }
+        if (updated == target) return
+        _uiState.value = _uiState.value.copy(
+            campaigns = current.map { if (it.id == target.id) updated else it },
+            selectedCampaign = if (_uiState.value.selectedCampaign?.id == target.id) {
+                updated
+            } else {
+                _uiState.value.selectedCampaign
+            }
+        )
+        if (event.isFill) {
+            repository.logAction(
+                asset = target.asset,
+                campaignId = target.id,
+                action = AuditLogAction.SLICE_FILLED,
+                reasonCode = "EXCHANGE_FILL",
+                message = "${target.family.displayName}: exchange fill ${event.lastFilledQty} @ ${event.lastFilledPrice} (${event.orderStatus})"
+            )
+        }
+    }
+
+    /** §22/§33: venue cancels for newly-dead boards + throttled position reconciliation. */
+    private suspend fun handleLiveExecution(previous: List<Campaign>, asset: CryptoAsset) {
+        val mode = _uiState.value.executionMode
+        if (mode != ExecutionMode.CAPPED_LIVE && mode != ExecutionMode.SCALED_LIVE) return
+        if (!sessionManager.hasValidActiveSession()) return
+
+        for (c in _uiState.value.campaigns) {
+            val prior = previous.find { it.id == c.id } ?: continue
+            val wasLive = prior.status == CampaignState.STAGED ||
+                prior.status == CampaignState.PARTIALLY_FILLED ||
+                prior.status == CampaignState.ACTIVE
+            val nowDead = c.status == CampaignState.CANCELLED || c.status == CampaignState.SUPPRESSED
+            if (wasLive && nowDead && prior.entryLadder.any { it.isResting && !it.isFilled }) {
+                val creds = sessionManager.copyCredentials() ?: continue
+                val cancelled = BinanceSignedClient.cancelAllOpenOrders(c.asset, creds.first, creds.second)
+                Arrays.fill(creds.first, '\u0000')
+                Arrays.fill(creds.second, '\u0000')
+                logLiveNote(
+                    c.id,
+                    if (cancelled) "VENUE_CANCELLED" else "VENUE_CANCEL_FAILED",
+                    "${c.family.displayName}: resting orders ${if (cancelled) "cancelled at venue" else "cancel failed at venue"}"
+                )
+            }
+        }
+
+        // §33: unexpected position mismatch check, throttled to one poll per 30 s.
+        val now = System.currentTimeMillis()
+        if (now - lastPositionCheckMs > 30_000) {
+            lastPositionCheckMs = now
+            val creds = sessionManager.copyCredentials()
+            if (creds != null) {
+                val exchange = BinanceSignedClient.fetchPositionRisk(asset.symbol, creds.first, creds.second)
+                Arrays.fill(creds.first, '\u0000')
+                Arrays.fill(creds.second, '\u0000')
+                if (exchange != null) {
+                    val expected = ExecutionGuardrails.expectedPositionQty(_uiState.value.campaigns, asset.lastPrice)
+                    if (ExecutionGuardrails.positionMismatchAction(expected, exchange.positionAmt) ==
+                        ExecutionGuardrails.PositionMismatchAction.FLATTEN_AND_LOCK
+                    ) {
+                        flattenAndLock(asset, expected, exchange.positionAmt)
+                    }
+                }
+            }
+        }
+    }
+
+    /** §33: unexpected position mismatch — flatten symbol, lock until reconciliation. */
+    private suspend fun flattenAndLock(asset: CryptoAsset, expectedQty: Double, exchangeQty: Double) {
+        val creds = sessionManager.copyCredentials()
+        if (creds != null) {
+            BinanceSignedClient.cancelAllOpenOrders(asset.symbol, creds.first, creds.second)
+            Arrays.fill(creds.first, '\u0000')
+            Arrays.fill(creds.second, '\u0000')
+        }
+        _uiState.value = _uiState.value.copy(
+            riskEnvelope = _uiState.value.riskEnvelope.copy(isKillSwitchEngaged = true),
+            campaigns = _uiState.value.campaigns.map { campaign ->
+                if (campaign.asset == asset.symbol) {
+                    campaign.copy(
+                        status = CampaignState.CANCELLED,
+                        entryLadder = campaign.entryLadder.map { it.copy(isResting = false) }
+                    )
+                } else campaign
+            }
+        )
+        repository.logAction(
+            asset = asset.symbol,
+            campaignId = "POSITION_GUARD",
+            action = AuditLogAction.EMERGENCY_KILL,
+            reasonCode = "POSITION_MISMATCH_LOCK",
+            message = "Unexpected position mismatch (expected $expectedQty, exchange $exchangeQty). Symbol flattened and locked until reconciliation."
+        )
+    }
+
+    private suspend fun logLiveNote(campaignId: String, reasonCode: String, message: String) {
+        repository.logAction(
+            asset = _uiState.value.selectedAsset?.symbol ?: "PORTFOLIO",
+            campaignId = campaignId,
+            action = AuditLogAction.CAMPAIGN_STAGED,
+            reasonCode = reasonCode,
+            message = message
+        )
+    }
+
     override fun onCleared() {
         super.onCleared()
         activeDeltaJob?.cancel()
         orderBookJob?.cancel()
         takerFlowJob?.cancel()
         dormantPollingJob?.cancel()
+        userDataJob?.cancel()
         sessionManager.terminateSessionAndWipeRam()
     }
 }

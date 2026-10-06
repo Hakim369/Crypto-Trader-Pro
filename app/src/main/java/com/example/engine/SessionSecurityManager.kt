@@ -52,6 +52,18 @@ class SessionSecurityManager {
         return _isSessionActive.value && !ephemeralApiKeyChars.isNullOrEmpty()
     }
 
+    /**
+     * Phase 4 (Spec §22): copies the active credentials out for exactly one signing
+     * operation. The originals are never exposed; the caller must zeroize both copies
+     * (Arrays.fill 0) immediately after the signed call completes.
+     */
+    fun copyCredentials(): Pair<CharArray, CharArray>? {
+        val key = ephemeralApiKeyChars
+        val secret = ephemeralApiSecretChars
+        if (key.isNullOrEmpty() || secret.isNullOrEmpty() || !_isSessionActive.value) return null
+        return Pair(key.copyOf(), secret.copyOf())
+    }
+
     fun updateHardwareDiagnostics(
         pingBinance: Long,
         pingCoinGlass: Long,
