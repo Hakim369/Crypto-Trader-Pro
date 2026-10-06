@@ -1,6 +1,7 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.BuildConfig
@@ -47,9 +48,11 @@ import com.example.engine.SessionSecurityManager
 import com.example.engine.SimulationHarness
 import com.example.engine.SimulationScenario
 import com.example.engine.UniverseScreener
+import com.example.engine.UniverseSnapshot
 import com.example.engine.StructureEngine
 import com.example.engine.TakerTrade
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -87,13 +90,20 @@ data class MainUiState(
     /** True once a real diagnostics sample has populated venueHealth (vs. built-in defaults). */
     val hasLiveDiagnostics: Boolean = false,
     /** True when the current universe came from live exchange discovery (vs offline seed). */
-    val isLiveUniverse: Boolean = false
+    val isLiveUniverse: Boolean = false,
+    /** §36: user tapped a live mode while no API session is unlocked — show the gate dialog. */
+    val isLiveModeBlocked: Boolean = false,
+    /** Real Binance futures wallet (USDT) once a live session is unlocked; null in paper. */
+    val liveWalletUsd: Double? = null
  )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = AppDatabase.getDatabase(application)
     private val repository = DatabaseRepository(db)
+
+    /** Paper-wallet config persistence (non-sensitive numbers only; Spec §5). */
+    private val paperPrefs = application.getSharedPreferences("paper_wallet_prefs", Context.MODE_PRIVATE)
 
     private val marketDataRepo = MarketDataRepository()
     private val universeScreener = UniverseScreener(db.candleDao())
@@ -125,12 +135,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var activeDeltaJob: Job? = null
     private var orderBookJob: Job? = null
     private var takerFlowJob: Job? = null
+    private var liveWalletJob: Job? = null
 
     init {
         // Optional CoinGlass key from the secrets-managed environment (never persisted).
         runCatching {
             CoinGlassClient.apiKey = BuildConfig.COINGLASS_API_KEY
         }
+        applyStoredPaperWallet()
         loadInitialData()
         observeAuditLogs()
         runPreFlightDiagnostics()
@@ -144,16 +156,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val defaultAsset = initialAssets.first()
 
         viewModelScope.launch {
-            val liveUniverse = runCatching { liveProvider.loadUniverseOnce() }
-                .getOrDefault(initialAssets)
-            val chosen = liveUniverse.firstOrNull() ?: defaultAsset
-            applyUniverseAndRecompute(liveUniverse, chosen)
+            val snapshot = runCatching { liveProvider.loadUniverseOnce() }
+                .getOrDefault(UniverseSnapshot(initialAssets, isLive = false))
+            val chosen = snapshot.assets.firstOrNull() ?: defaultAsset
+            applyUniverseAndRecompute(snapshot.assets, chosen, snapshot.isLive)
         }
 
         val map = structureEngine.buildLevelMap(defaultAsset)
         val candidatePaths = pathEngine.rankCandidatePaths(defaultAsset, map)
         val initialCampaigns = campaignEngine.planCampaigns(defaultAsset, map, candidatePaths)
-        val initialEvidence = featureEngine.buildEvidenceFrame(defaultAsset)
+        // §4: deterministic evidence even for the seed placeholder — no Random values
+        // are ever painted as if they were market data.
+        val initialEvidence = liveProvider.buildEvidenceFrame(defaultAsset)
 
         _uiState.value = _uiState.value.copy(
             assets = initialAssets,
@@ -202,7 +216,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Applies a freshly-screened universe and recomputes analytics for the chosen symbol. */
-    private suspend fun applyUniverseAndRecompute(universe: List<CryptoAsset>, chosen: CryptoAsset) {
+    private suspend fun applyUniverseAndRecompute(
+        universe: List<CryptoAsset>,
+        chosen: CryptoAsset,
+        isLive: Boolean
+    ) {
         // §8: build the level map from real swing structure when candle history exists;
         // fall back to the ATR-offset synthesis only when no candles are available.
         val timeframes = runCatching { universeScreener.loadTimeframes(chosen.symbol) }.getOrNull()
@@ -233,7 +251,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             selectedCampaign = gatedCampaigns.firstOrNull(),
             liveEvidence = evidence,
             calibration = calibration,
-            isLiveUniverse = universe.any { it.quoteVolume24h > 0 && it.orderBookSpreadPct < 100.0 }
+            isLiveUniverse = isLive
         )
         routeLiveBoards(gatedCampaigns)
         startUserDataStreamIfNeeded()
@@ -327,7 +345,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // once loaded; the synchronous paint above keeps first response instant.
         viewModelScope.launch {
             if (_uiState.value.selectedAsset?.symbol == asset.symbol) {
-                applyUniverseAndRecompute(_uiState.value.assets, asset)
+                applyUniverseAndRecompute(_uiState.value.assets, asset, _uiState.value.isLiveUniverse)
             }
         }
 
@@ -346,11 +364,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun startDormantUniversePolling() {
         dormantPollingJob?.cancel()
         dormantPollingJob = viewModelScope.launch {
-            liveProvider.dormantUniversePolling().collect { universe ->
+            liveProvider.dormantUniversePolling().collect { snapshot ->
                 val currentSymbol = _uiState.value.selectedAsset?.symbol
-                val chosen = universe.find { it.symbol == currentSymbol } ?: universe.firstOrNull()
+                val chosen = snapshot.assets.find { it.symbol == currentSymbol } ?: snapshot.assets.firstOrNull()
                 if (chosen != null) {
-                    applyUniverseAndRecompute(universe, chosen)
+                    applyUniverseAndRecompute(snapshot.assets, chosen, snapshot.isLive)
                 }
             }
         }
@@ -362,8 +380,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = _uiState.value.copy(selectedCampaign = campaign)
     }
 
+    fun dismissLiveModeGate() {
+        _uiState.value = _uiState.value.copy(isLiveModeBlocked = false)
+    }
+
     fun setExecutionMode(mode: ExecutionMode) {
+        val isLiveMode = mode == ExecutionMode.CAPPED_LIVE || mode == ExecutionMode.SCALED_LIVE
+        // §36: live modes require an unlocked in-memory API session. Gate with a
+        // dialog instead of switching silently into a mode that cannot route orders.
+        if (isLiveMode && !sessionManager.hasValidActiveSession()) {
+            _uiState.value = _uiState.value.copy(isLiveModeBlocked = true)
+            viewModelScope.launch {
+                repository.logAction(
+                    asset = _uiState.value.selectedAsset?.symbol ?: "ALL",
+                    campaignId = "MODE_SWITCH",
+                    action = AuditLogAction.CAMPAIGN_STAGED,
+                    reasonCode = "LIVE_MODE_GATE",
+                    message = "${mode.displayName} requires an active API session. Open Guardrails to enter your key."
+                )
+            }
+            return
+        }
         _uiState.value = _uiState.value.copy(executionMode = mode)
+        if (isLiveMode) startLiveWalletPolling()
         viewModelScope.launch {
             repository.logAction(
                 asset = _uiState.value.selectedAsset?.symbol ?: "ALL",
@@ -594,6 +633,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startApiSession(key: String, secret: String) {
         sessionManager.startSession(key, secret)
+        // Real Binance wallet becomes visible as soon as a session is unlocked.
+        startLiveWalletPolling()
         viewModelScope.launch {
             repository.logAction(
                 asset = "PORTFOLIO",
@@ -606,7 +647,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun terminateApiSession() {
+        liveWalletJob?.cancel()
+        liveWalletJob = null
         sessionManager.terminateSessionAndWipeRam()
+        _uiState.value = _uiState.value.copy(liveWalletUsd = null)
         viewModelScope.launch {
             repository.logAction(
                 asset = "PORTFOLIO",
@@ -1113,6 +1157,87 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ------------------------------------------------------- paper wallet & live wallet
+
+    /** Loads the persisted paper-wallet config; resets the fake demo PnL/exposure to zero. */
+    private fun applyStoredPaperWallet() {
+        _uiState.value = _uiState.value.copy(
+            riskEnvelope = RiskEnvelope(
+                accountEquityUsd = paperPrefs.getFloat(KEY_PAPER_EQUITY, 50_000f).toDouble(),
+                riskPerCampaignPct = paperPrefs.getFloat(KEY_PAPER_RISK_PCT, 0.5f).toDouble(),
+                maxGrossExposureUsd = paperPrefs.getFloat(KEY_PAPER_MAX_GROSS, 100_000f).toDouble(),
+                dailyLossLimitR = paperPrefs.getFloat(KEY_PAPER_DAILY_LOSS_R, 2.0f).toDouble(),
+                // No invented demo exposure/PnL — the paper wallet starts clean.
+                currentGrossExposureUsd = 0.0,
+                dailyPnLUsd = 0.0,
+                worstCaseStopOutR = 0.0
+            )
+        )
+    }
+
+    /**
+     * §5 paper mode: the user-configured wallet drives sizing and worst-case stop-out
+     * math while trade outcomes stay simulated. Values persist across app restarts.
+     */
+    fun updatePaperWallet(
+        equityUsd: Double,
+        riskPerCampaignPct: Double,
+        maxGrossExposureUsd: Double,
+        dailyLossLimitR: Double
+    ) {
+        if (equityUsd <= 0.0) return
+        val risk = riskPerCampaignPct.coerceIn(0.05, 1.0)
+        val lossLimit = dailyLossLimitR.coerceIn(0.5, 5.0)
+        paperPrefs.edit()
+            .putFloat(KEY_PAPER_EQUITY, equityUsd.toFloat())
+            .putFloat(KEY_PAPER_RISK_PCT, risk.toFloat())
+            .putFloat(KEY_PAPER_MAX_GROSS, maxGrossExposureUsd.coerceAtLeast(0.0).toFloat())
+            .putFloat(KEY_PAPER_DAILY_LOSS_R, lossLimit.toFloat())
+            .apply()
+        _uiState.value = _uiState.value.copy(
+            riskEnvelope = _uiState.value.riskEnvelope.copy(
+                accountEquityUsd = equityUsd,
+                riskPerCampaignPct = risk,
+                maxGrossExposureUsd = maxGrossExposureUsd.coerceAtLeast(0.0),
+                dailyLossLimitR = lossLimit
+            )
+        )
+        viewModelScope.launch {
+            repository.logAction(
+                asset = "PORTFOLIO",
+                campaignId = "PAPER_WALLET",
+                action = AuditLogAction.CAMPAIGN_STAGED,
+                reasonCode = "PAPER_WALLET_UPDATED",
+                message = "Paper wallet set: equity $${equityUsd.toInt()}, risk $risk%/campaign, maxGross $${maxGrossExposureUsd.toInt()}, daily stop ${lossLimit}R"
+            )
+        }
+    }
+
+    /** §36 live mode: poll the real Binance futures wallet while the session is unlocked. */
+    private fun startLiveWalletPolling() {
+        if (!sessionManager.hasValidActiveSession()) return
+        liveWalletJob?.cancel()
+        liveWalletJob = viewModelScope.launch {
+            while (true) {
+                refreshLiveWallet()
+                delay(60_000)
+            }
+        }
+    }
+
+    private suspend fun refreshLiveWallet() {
+        val creds = sessionManager.copyCredentials() ?: return
+        try {
+            val balance = BinanceSignedClient.fetchWalletBalance(creds.first, creds.second)
+            if (balance != null) {
+                _uiState.value = _uiState.value.copy(liveWalletUsd = balance)
+            }
+        } finally {
+            Arrays.fill(creds.first, '\u0000')
+            Arrays.fill(creds.second, '\u0000')
+        }
+    }
+
     private suspend fun logLiveNote(campaignId: String, reasonCode: String, message: String) {
         repository.logAction(
             asset = _uiState.value.selectedAsset?.symbol ?: "PORTFOLIO",
@@ -1130,6 +1255,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         takerFlowJob?.cancel()
         dormantPollingJob?.cancel()
         userDataJob?.cancel()
+        liveWalletJob?.cancel()
         sessionManager.terminateSessionAndWipeRam()
+    }
+
+    private companion object {
+        const val KEY_PAPER_EQUITY = "paper_equity_usd"
+        const val KEY_PAPER_RISK_PCT = "paper_risk_pct"
+        const val KEY_PAPER_MAX_GROSS = "paper_max_gross_usd"
+        const val KEY_PAPER_DAILY_LOSS_R = "paper_daily_loss_r"
     }
 }
