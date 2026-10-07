@@ -151,6 +151,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         observeAuditLogs()
         runPreFlightDiagnostics()
         startDormantUniversePolling()
+        startDiagnosticsPolling()
     }
 
     private fun loadInitialData() {
@@ -696,21 +697,74 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * §37: scenario runs are derived from real candle history through the deterministic
+     * ReplayEngine — never from invented literals. When persisted history is
+     * insufficient the run degrades to the scenario's documented posture and says so;
+     * it never fabricates a live reading.
+     */
     fun runSimulationScenario(scenario: SimulationScenario) {
-        val metrics = simulationHarness.runScenarioSimulation(scenario.id)
-        _uiState.value = _uiState.value.copy(
-            selectedScenario = scenario,
-            backtestMetrics = metrics
-        )
-
+        if (_uiState.value.isReplayRunning) return
+        _uiState.value = _uiState.value.copy(selectedScenario = scenario, isReplayRunning = true)
         viewModelScope.launch {
-            repository.logAction(
-                asset = _uiState.value.selectedAsset?.symbol ?: "SIMULATION",
-                campaignId = scenario.id,
-                action = AuditLogAction.CAMPAIGN_STAGED,
-                reasonCode = "SCENARIO_EXECUTED",
-                message = "Backtest scenario executed: ${scenario.name}. Captured move: ${metrics.capturedMoveBeforeConfirmationPct}%"
-            )
+            try {
+                val asset = _uiState.value.selectedAsset
+                val candles = asset?.let {
+                    runCatching { universeScreener.loadTimeframes(it.symbol).candles1h }.getOrDefault(emptyList())
+                }.orEmpty()
+                val hadHistory = asset != null && candles.size >= MIN_SCENARIO_CANDLES
+                val metrics = if (hadHistory && asset != null) {
+                    val calibration = runCatching { universeScreener.loadCalibration(asset) }.getOrNull()
+                    replayEngine.replay(
+                        asset = asset,
+                        candles = candles,
+                        fundingRatePct = asset.fundingRatePct,
+                        spreadPct = asset.orderBookSpreadPct,
+                        calibration = calibration
+                    ).metrics
+                } else {
+                    // §37 honest degradation: no persisted history → no invented numbers.
+                    // The audit trail records exactly why the metrics stay neutral.
+                    BacktestMetrics()
+                }
+                _uiState.value = _uiState.value.copy(backtestMetrics = metrics, isReplayRunning = false)
+                repository.logAction(
+                    asset = _uiState.value.selectedAsset?.symbol ?: "SIMULATION",
+                    campaignId = scenario.id,
+                    action = AuditLogAction.CAMPAIGN_STAGED,
+                    reasonCode = if (hadHistory) "SCENARIO_EXECUTED" else "SCENARIO_DEGRADED",
+                    message = if (hadHistory) {
+                            "Scenario replayed over ${candles.size} persisted 1h candles: ${scenario.name}. " +
+                                "Captured move: ${metrics.capturedMoveBeforeConfirmationPct}%"
+                        } else {
+                            "Scenario ${scenario.name} had insufficient candle history " +
+                                "(${candles.size} < $MIN_SCENARIO_CANDLES); metrics stayed neutral " +
+                                "instead of inventing numbers (§37)"
+                        }
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(isReplayRunning = false)
+                logLiveNote(
+                    scenario.id,
+                    "SCENARIO_FAILED",
+                    "Scenario replay failed: ${e.message ?: e.javaClass.simpleName}"
+                )
+            }
+        }
+    }
+
+    /**
+     * §2/§33: hardware + mandatory-feed latency are re-sampled on a fixed cadence so
+     * stale-feed, latency, RAM, thermal and low-power guardrails always act on live
+     * health instead of a startup-only snapshot. feedStaleness is derived from the
+     * latest probes inside SessionSecurityManager.
+     */
+    private fun startDiagnosticsPolling() {
+        viewModelScope.launch {
+            while (true) {
+                delay(DIAGNOSTICS_RE_SAMPLE_MS)
+                runPreFlightDiagnostics()
+            }
         }
     }
 
@@ -1344,5 +1398,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val KEY_PAPER_RISK_PCT = "paper_risk_pct"
         const val KEY_PAPER_MAX_GROSS = "paper_max_gross_usd"
         const val KEY_PAPER_DAILY_LOSS_R = "paper_daily_loss_r"
+        /** Minimum persisted 1h candles a scenario replay needs to count as history-driven. */
+        const val MIN_SCENARIO_CANDLES = 30
+        /** §2/§33 diagnostics cadence: re-sample hardware + feed latency every minute. */
+        const val DIAGNOSTICS_RE_SAMPLE_MS = 60_000L
     }
 }

@@ -82,6 +82,7 @@ class UniverseScreener(private val candleDao: CandleDao) {
             val fundingDeferred = async { CoinGlassClient.fetchFundingRates() }
             val oisDeferred = async { CoinGlassClient.fetchOpenInterestUsd() }
             val basisDeferred = async { CoinGlassClient.fetchBasis() }
+            val liqDeferred = async { CoinGlassClient.fetchLiquidationHistory24h() }
 
             val info = exchangeInfo.await() ?: return@coroutineScope emptyList()
             val spotBaseSet = spotBases.await().toSet()
@@ -90,6 +91,7 @@ class UniverseScreener(private val candleDao: CandleDao) {
             val funding = fundingDeferred.await()
             val ois = oisDeferred.await()
             val basis = basisDeferred.await()
+            val liq = liqDeferred.await()
             val coinGlassReachable = funding.isNotEmpty() || ois.isNotEmpty()
 
             val tradablePerps = info.symbols.filter {
@@ -155,6 +157,18 @@ class UniverseScreener(private val candleDao: CandleDao) {
 
                         val regime = classifyRegime(strategicBias, tacticalBias)
                         val pain = IndicatorMath.painScore(fundingRate, tacticalBias)
+                        val mid = lastPrice
+                        val premium = candidate.premium
+                        val index = premium?.indexPrice ?: mid
+                        val mark = premium?.markPrice ?: mid
+                        val basisFromBinance = if (index > 0.0 && mark > 0.0) {
+                            (mark - index) / index * 100.0 * 365.0
+                        } else 0.0
+                        val basisPremiumPct = when {
+                            basis.containsKey(candidate.symbol) -> basis[candidate.symbol]
+                            else -> basisFromBinance
+                        }
+                        val liq = liq[candidate.symbol] ?: Pair(0.0, 0.0)
 
                         CryptoAsset(
                             symbol = candidate.symbol,
@@ -164,16 +178,23 @@ class UniverseScreener(private val candleDao: CandleDao) {
                             quoteVolume24h = candidate.ticker.quoteVolume ?: 0.0,
                             orderBookSpreadPct = spreads[candidate.symbol] ?: 100.0,
                             fundingRatePct = fundingRate,
-                            predictedFundingPct = candidate.premium?.lastFundingRate ?: fundingRate,
+                            predictedFundingPct = premium?.lastFundingRate ?: fundingRate,
                             openInterestUsd = ois[candidate.symbol] ?: 0.0,
-                            basisPremiumPct = basis[candidate.symbol] ?: 0.0,
+                            basisPremiumPct = basisPremiumPct,
                             atr5m = atrFor(candidate.symbol, "5m", lastPrice),
                             atr1h = atrFor(candidate.symbol, "1h", lastPrice),
                             atr4h = atrFor(candidate.symbol, "4h", lastPrice),
                             regime = regime,
                             tacticalBias = tacticalBias,
                             strategicBias = strategicBias,
-                            primaryPainPath = buildPainPath(pain, tacticalBias, strategicBias)
+                            primaryPainPath = buildPainPath(
+                                pain,
+                                tacticalBias,
+                                strategicBias,
+                                liq.first,
+                                liq.second
+                            ),
+                            liquidationContext = liquidationContextFor(candidate.symbol, liq)
                         )
                     }
                 }
@@ -283,7 +304,18 @@ class UniverseScreener(private val candleDao: CandleDao) {
         else -> MarketRegime.BALANCE
     }
 
-    private fun buildPainPath(pain: Int, tactical: Int, strategic: Int): String {
+    private fun buildPainPath(
+        pain: Int,
+        tactical: Int,
+        strategic: Int,
+        longLiquidatedUsd24h: Double = 0.0,
+        shortLiquidatedUsd24h: Double = 0.0
+    ): String {
+        val heaviestSide = when {
+            longLiquidatedUsd24h > shortLiquidatedUsd24h * 1.8 -> "L-side flush"
+            shortLiquidatedUsd24h > longLiquidatedUsd24h * 1.8 -> "S-side flush"
+            else -> "no flush"
+        }
         val dir = when {
             tactical >= 20 && strategic >= 20 -> "Bull continuation"
             tactical <= -20 && strategic <= -20 -> "Bear continuation"
@@ -292,6 +324,18 @@ class UniverseScreener(private val candleDao: CandleDao) {
             else -> "Range rotation"
         }
         return "$dir (pain $pain)"
+    }
+
+    private fun liquidationContextFor(symbol: String, liq: Pair<Double, Double>): LiquidationContext {
+        return if (liq.first > 0.0 || liq.second > 0.0) {
+            LiquidationContext(
+                longLiquidatedUsd24h = liq.first,
+                shortLiquidatedUsd24h = liq.second,
+                lastUpdatedMs = System.currentTimeMillis()
+            )
+        } else {
+            LiquidationContext.EMPTY
+        }
     }
 
     private fun CandleEntity.toDomain() = BinanceFuturesClient.Candle(

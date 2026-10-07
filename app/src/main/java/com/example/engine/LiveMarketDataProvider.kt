@@ -2,6 +2,7 @@ package com.example.engine
 
 import com.example.data.model.CryptoAsset
 import com.example.data.model.EvidenceFrame
+import com.example.data.model.LiquidationContext
 import com.example.data.remote.BinanceFuturesClient
 import com.example.data.remote.BinanceWebSocketClient
 import com.example.data.remote.CoinGlassClient
@@ -78,6 +79,26 @@ class LiveMarketDataProvider(private val screener: UniverseScreener) {
         } else {
             UniverseSnapshot(screener.offlineSeedUniverse(), isLive = false)
         }
+    }
+
+    override fun buildEvidenceFrame(asset: CryptoAsset): EvidenceFrame {
+        val normalizedTick = lastNormalizedTick
+        val regimeDrift = when (asset.regime) {
+            MarketRegime.BULLISH_CONTINUATION -> 0.12
+            MarketRegime.BEARISH_CONTINUATION -> -0.12
+            else -> 0.0
+        }
+        return FeatureEngine().buildEvidenceFrame(
+            asset = asset,
+            normalizedTick = when (normalizedTick) {
+                NormalizedTick.LOW_VOL, NormalizedTick.NO_DATA, NormalizedTick.SAY_PRICE, NormalizedTick.HIGH_VOL,
+                null -> NormalizedTick.NO_DATA
+                else -> normalizedTick
+            },
+            currentRegime = asset.regime,
+            oiFromCorpus = lastCorpusOtsBySymbol[asset.symbol],
+            regimeDrift = regimeDrift
+        )
     }
 
     /**
