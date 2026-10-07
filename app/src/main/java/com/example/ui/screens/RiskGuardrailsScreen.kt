@@ -148,7 +148,14 @@ fun RiskGuardrailsScreen(
                     }
                     Column {
                         Text("Daily PnL / Limit", style = MaterialTheme.typography.labelSmall.copy(color = SlateTextMuted, fontSize = 9.sp))
-                        Text("+$${riskEnvelope.dailyPnLUsd.toInt()} (2.0R)", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, color = EmeraldBull))
+                        Text(
+                            text = "${if (riskEnvelope.dailyPnLUsd >= 0.0) "+" else "-"}$${kotlin.math.abs(riskEnvelope.dailyPnLUsd).toInt()} (Stop: -${riskEnvelope.dailyLossLimitR}R)",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace,
+                                color = if (riskEnvelope.dailyPnLUsd >= 0.0) EmeraldBull else CrimsonBear
+                            )
+                        )
                     }
                 }
 

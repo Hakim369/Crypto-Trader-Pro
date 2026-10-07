@@ -39,6 +39,7 @@ import com.example.engine.MarketDataRepository
 import com.example.engine.OrphanInterceptDecision
 import com.example.engine.OrphanInterceptPolicy
 import com.example.engine.OrderBookSnapshot
+import com.example.engine.PaperPnl
 import com.example.engine.OverrideWarning
 import com.example.engine.PathEngine
 import com.example.engine.ReplayEngine
@@ -136,6 +137,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var orderBookJob: Job? = null
     private var takerFlowJob: Job? = null
     private var liveWalletJob: Job? = null
+
+    /** §5 Paper wallet: cumulative realized PnL today (USD), booked at flatten events. */
+    private var paperRealizedPnlUsd = 0.0
 
     init {
         // Optional CoinGlass key from the secrets-managed environment (never persisted).
@@ -430,9 +434,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = _uiState.value.copy(
             riskEnvelope = _uiState.value.riskEnvelope.copy(isKillSwitchEngaged = updated),
             campaigns = if (updated) {
-                // Flatten and suppress all active campaigns
-                _uiState.value.campaigns.map {
-                    it.copy(status = CampaignState.CANCELLED)
+                // Flatten and suppress all active campaigns. §5 Paper mode: the kill
+                // switch also closes open paper positions at the last traded price.
+                val flattenPrice = _uiState.value.selectedAsset?.lastPrice ?: 0.0
+                _uiState.value.campaigns.map { c ->
+                    var flattened = c.copy(status = CampaignState.CANCELLED)
+                    if (_uiState.value.executionMode == ExecutionMode.PAPER &&
+                        c.entryLadder.any { slice -> slice.isFilled }
+                    ) {
+                        paperRealizedPnlUsd += PaperPnl.realizedPnlAtFlatten(c, flattenPrice)
+                        flattened = flattened.copy(
+                            entryLadder = c.entryLadder.map { slice ->
+                                slice.copy(isFilled = false, isResting = false)
+                            }
+                        )
+                    }
+                    flattened
                 }
             } else _uiState.value.campaigns
         )
@@ -499,6 +516,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val index = currentCampaigns.indexOfFirst { it.id == campaignId }
         if (index != -1) {
             val c = currentCampaigns[index]
+            // §5 Paper mode: an operator flatten closes the paper position — book
+            // realized PnL at the hard stop before the fills are cleared below.
+            if (_uiState.value.executionMode == ExecutionMode.PAPER &&
+                c.entryLadder.any { it.isFilled }
+            ) {
+                val realized = PaperPnl.realizedPnlAtFlatten(c, c.stopLogic.hardStopPrice)
+                paperRealizedPnlUsd += realized
+                viewModelScope.launch {
+                    repository.logAction(
+                        asset = c.asset,
+                        campaignId = c.id,
+                        action = AuditLogAction.HARD_FLATTEN,
+                        reasonCode = "PAPER_FLATTEN",
+                        message = "${c.family.displayName}: operator flatten booked realized PnL $${"%.2f".format(realized)}"
+                    )
+                }
+            }
             val updated = c.copy(
                 status = CampaignState.CANCELLED,
                 entryLadder = c.entryLadder.map { it.copy(isResting = false, isFilled = false) },
@@ -729,6 +763,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         filled
                     }
+
+                    // §5 Paper wallet accounting: a board that just went CANCELLED while
+                    // still holding fills was hard-flattened by the invalidation engine —
+                    // book realized PnL at the hard stop and release its exposure. The
+                    // realized R total feeds the daily-loss stop (currentRealizedLossR).
+                    working = working.map { c ->
+                        val before = previousCampaigns.find { it.id == c.id }
+                        val hadFills = before?.entryLadder?.any { it.isFilled } == true
+                        if (hadFills && c.status == CampaignState.CANCELLED &&
+                            c.entryLadder.any { it.isFilled }
+                        ) {
+                            val realized = PaperPnl.realizedPnlAtFlatten(c, c.stopLogic.hardStopPrice)
+                            paperRealizedPnlUsd += realized
+                            repository.logAction(
+                                asset = c.asset,
+                                campaignId = c.id,
+                                action = AuditLogAction.HARD_FLATTEN,
+                                reasonCode = "PAPER_FLATTEN",
+                                message = "${c.family.displayName}: paper position flattened at stop ${c.stopLogic.hardStopPrice}; realized PnL $${"%.2f".format(realized)}"
+                            )
+                            c.copy(entryLadder = c.entryLadder.map { it.copy(isFilled = false, isResting = false) })
+                        } else c
+                    }
                 }
 
                 // §26 Board promotion: a dead primary upgrades healthy secondaries.
@@ -792,12 +849,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.value.riskEnvelope.accountEquityUsd
                 )
 
+                // §5 Paper wallet: exposure + PnL derived from the actual ladder fills
+                // (never invented). Realized losses convert to R against the configured
+                // per-campaign risk budget so the daily-loss stop (isDailyLossExceeded)
+                // becomes a live gate in paper mode.
+                val envelope = _uiState.value.riskEnvelope
+                val updatedEnvelope = if (_uiState.value.executionMode == ExecutionMode.PAPER) {
+                    val realizedR = PaperPnl.pnlToR(
+                        paperRealizedPnlUsd,
+                        envelope.accountEquityUsd,
+                        envelope.riskPerCampaignPct
+                    )
+                    envelope.copy(
+                        currentGrossExposureUsd = PaperPnl.openExposureUsd(working),
+                        dailyPnLUsd = paperRealizedPnlUsd +
+                            PaperPnl.unrealizedPnlUsd(working, updatedAsset.lastPrice),
+                        currentRealizedLossR = Math.round(minOf(0.0, realizedR) * 100.0) / 100.0,
+                        worstCaseStopOutR = worstCaseR
+                    )
+                } else {
+                    envelope.copy(worstCaseStopOutR = worstCaseR)
+                }
+
                 _uiState.value = _uiState.value.copy(
                     selectedAsset = updatedAsset,
                     liveEvidence = evidence,
                     campaigns = working,
                     selectedCampaign = working.find { it.id == _uiState.value.selectedCampaign?.id } ?: working.firstOrNull(),
-                    riskEnvelope = _uiState.value.riskEnvelope.copy(worstCaseStopOutR = worstCaseR)
+                    riskEnvelope = updatedEnvelope
                 )
 
                 // §22/§33: push cancellations to the venue and reconcile the live position.
@@ -1170,6 +1249,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 // No invented demo exposure/PnL — the paper wallet starts clean.
                 currentGrossExposureUsd = 0.0,
                 dailyPnLUsd = 0.0,
+                currentRealizedLossR = 0.0,
                 worstCaseStopOutR = 0.0
             )
         )
