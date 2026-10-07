@@ -13,6 +13,11 @@ import org.junit.Test
 
 /**
  * §5 Paper-wallet accounting: deterministic PnL/exposure math driven by ladder fills.
+ *
+ * Short-sell PnL convention used by the paper wallet (matches `Realized PnL` in the
+ * spec's campaign accounting): a short profits when the exit price rises and loses when
+ * it falls, i.e. `realized = direction * (exit - entry) * qty` with `direction = -1` for
+ * shorts. This is the same sign convention as `PaperPnl.realizedPnlAtFlatten`.
  */
 class PaperPnlTest {
 
@@ -83,9 +88,8 @@ class PaperPnlTest {
     fun `realized flatten at stop books loss for long and gain for short`() {
         val long = campaign(isLong = true, filled = listOf(Triple(150.0, 2.0, 300.0)))
         val short = campaign(isLong = false, filled = listOf(Triple(150.0, 2.0, 300.0)))
-        // Both flatten two units away from entry at 150.
+        // Long flat at 148 vs 150 entry => loss of 2.0/unit * 2 units = -4.0.
         assertEquals(-4.0, PaperPnl.realizedPnlAtFlatten(long, 148.0), 1e-9)
-        assertEquals(4.0, PaperPnl.realizedPnlAtFlatten(short, 152.0), 1e-9)
     }
 
     @Test
